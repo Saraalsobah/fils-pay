@@ -234,6 +234,62 @@ func TestRecalculateMDR_OutOfRangeBatchUntouched(t *testing.T) {
 	}
 }
 
+// A batch that has already been PAID OUT is final: the money has left. Recalculating
+// the fee must not rewrite its fee/net (they would no longer match what was paid and
+// disbursed), must not post ledger adjustments against it, and must not move the
+// merchant balance cache for a payout that already happened.
+func TestRecalculateMDR_PaidBatchIsLeftAlone(t *testing.T) {
+	pool := mustPool(t)
+	ctx := context.Background()
+	const originalMdrBps = 250
+	merchantID := insertActiveMerchant(t, pool, originalMdrBps)
+
+	businessDate := time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC)
+	start, _ := BusinessDayWindow(businessDate)
+	insertCaptureEvent(t, pool, merchantID, originalMdrBps, 50_000, start.Add(time.Hour))
+
+	closed, err := CloseBatch(ctx, pool, merchantID, businessDate)
+	if err != nil {
+		t.Fatalf("CloseBatch: %v", err)
+	}
+	if _, err := PayoutBatch(ctx, pool, closed.BatchID); err != nil {
+		t.Fatalf("PayoutBatch: %v", err)
+	}
+
+	var cacheBefore int64
+	_ = pool.QueryRow(ctx, `SELECT COALESCE(sum(cached_payable_fils),0) FROM merchant_balances WHERE merchant_id = $1`, merchantID).Scan(&cacheBefore)
+
+	if _, err := pool.Exec(ctx, `UPDATE merchants SET mdr_bps = 400 WHERE id = $1`, merchantID); err != nil {
+		t.Fatalf("update mdr_bps: %v", err)
+	}
+	from, to := recalcWindow(businessDate)
+	result, err := RecalculateMDR(ctx, pool, merchantID, from, to)
+	if err != nil {
+		t.Fatalf("RecalculateMDR: %v", err)
+	}
+	if len(result.Adjusted) != 0 {
+		t.Fatalf("a paid batch was adjusted: %+v", result.Adjusted)
+	}
+
+	var fee, net int64
+	if err := pool.QueryRow(ctx, `SELECT fee_fils, net_payout_fils FROM settlement_batches WHERE id = $1`, closed.BatchID).Scan(&fee, &net); err != nil {
+		t.Fatalf("read batch: %v", err)
+	}
+	if fee != int64(closed.FeeFils) || net != int64(closed.NetPayoutFils) {
+		t.Errorf("paid batch changed: fee %d->%d net %d->%d", closed.FeeFils, fee, closed.NetPayoutFils, net)
+	}
+	var adjustmentCount int
+	_ = pool.QueryRow(ctx, `SELECT count(*) FROM ledger_entries WHERE settlement_batch_id = $1 AND description = 'MDR recalculation adjustment'`, closed.BatchID).Scan(&adjustmentCount)
+	if adjustmentCount != 0 {
+		t.Errorf("posted %d MDR adjustment legs against a paid batch", adjustmentCount)
+	}
+	var cacheAfter int64
+	_ = pool.QueryRow(ctx, `SELECT COALESCE(sum(cached_payable_fils),0) FROM merchant_balances WHERE merchant_id = $1`, merchantID).Scan(&cacheAfter)
+	if cacheAfter != cacheBefore {
+		t.Errorf("balance cache moved %d -> %d for a paid batch", cacheBefore, cacheAfter)
+	}
+}
+
 // compile-time assertion that RecalculateMDR keeps the *pgxpool.Pool
 // signature the internal API handler passes it.
 var _ func(context.Context, *pgxpool.Pool, uuid.UUID, time.Time, time.Time) (RecalcResult, error) = RecalculateMDR

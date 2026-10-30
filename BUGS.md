@@ -346,3 +346,12 @@ Note: the postmortem root cause (duplicate callbacks) was real but is a separate
 
 Test: `scheduler/daemon_test.go` `TestDueBusinessDate` (fails on the old logic: due during the grace period, wrong date at 00:15 and 02:59 Bahrain).
 Deliberately NOT changed: `BusinessDayWindow` itself keeps its calendar-date contract (the CLI `--date` and the existing window tests depend on it); the fix is in the caller. The "restart at 00:05 closes early" claim in a comment is false: the boot run goes through the same due check.
+
+## MDR recalculation rewrote paid batches (bug 34)
+
+| # | Bug | Where | Fix |
+|---|-----|-------|-----|
+| 34 | `RecalculateMDR` selected every batch with `status <> 'open'`, so it also rewrote batches that were already **paid out**: it changed their `fee_fils`/`net_payout_fils` after the money had left, posted ledger adjustments against them and moved the balance cache for a payout that had already happened. The batch row then disagreed with what was actually paid and disbursed. The type comment even says the original batch's figures "stay as they were paid". The admin docs call the endpoint "safe" and finance runs it after every rate change | `settlement/recalculate_mdr.go` | only `status = 'closed'` (not yet paid) batches are recalculated |
+
+Test: `TestRecalculateMDR_PaidBatchIsLeftAlone` (before: a paid batch's fee went 1,250 -> 2,000 fils).
+Lead (not changed): a rate correction on already-paid days is then never recovered; finance needs an explicit adjustment posted into the current open batch.
