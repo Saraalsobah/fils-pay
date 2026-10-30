@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { after, test } from "node:test";
 import { Pool } from "pg";
+import { AppError } from "../lib/errors.js";
 import {
   applyAdjustmentImport,
   getAdjustmentImportRows,
@@ -250,4 +251,35 @@ test("listAdjustmentImports returns newest first and paginates", async () => {
 test("getAdjustmentImportRows returns an empty list for an unknown import", async () => {
   const rows = await getAdjustmentImportRows(pool, randomUUID());
   assert.deepEqual(rows, []);
+});
+
+// The same CSV applied twice used to post every adjustment twice (nothing identified an upload).
+test("applying the same rows twice is rejected, even under a different filename, and posts once", async () => {
+  const adminUserId = await createAdminUser();
+  const merchantId = await createMerchant();
+  const rows = [{ merchantId, amount: "4.75", reason: "statement correction" }];
+
+  await applyAdjustmentImport(pool, { adminUserId, originalFilename: "march.csv", rows });
+  await assert.rejects(
+    applyAdjustmentImport(pool, { adminUserId, originalFilename: "march-renamed.csv", rows }),
+    (err: unknown) => err instanceof AppError && err.statusCode === 409 && err.code === "adjustment_import_already_applied",
+  );
+
+  const bal = await pool.query<{ n: string }>(
+    `SELECT COALESCE(sum(amount_fils) FILTER (WHERE direction = 'credit'), 0)::text AS n FROM ledger_entries WHERE merchant_id = $1`,
+    [merchantId],
+  );
+  assert.equal(Number(bal.rows[0]!.n), 4750, "the second upload must not post anything");
+});
+
+test("two concurrent uploads of the same rows apply exactly once", async () => {
+  const adminUserId = await createAdminUser();
+  const merchantId = await createMerchant();
+  const rows = [{ merchantId, amount: "2.00" }];
+  const results = await Promise.allSettled([
+    applyAdjustmentImport(pool, { adminUserId, originalFilename: "a.csv", rows }),
+    applyAdjustmentImport(pool, { adminUserId, originalFilename: "b.csv", rows }),
+  ]);
+  assert.equal(results.filter((r) => r.status === "fulfilled").length, 1);
+  assert.equal(results.filter((r) => r.status === "rejected").length, 1);
 });
