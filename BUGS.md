@@ -289,3 +289,13 @@ capture, refund, close and payout the cached balance and the balance rebuilt fro
 | 22 | `OTP_DEV_EXPOSE=true` in production returned the login code in the API response | `config.ts` | `loadConfig` refuses to start in production with it on |
 
 Tests: `apps/api/src/routes/authOtp.test.ts` (7 tests, 6 failed before the fixes).
+
+## Authorization (bugs 23-25)
+
+| # | Bug | Where | Fix |
+|---|-----|-----|-----|
+| 23 | Capture and void had only `requireMerchantAuth`, no role check: a `support` user could move money (the void route even had a `TODO role check?`) | `routes/transactions.ts` | `requireMerchantRole("owner","finance")`, same as refunds and payment links |
+| 24 | An admin "view as merchant" grant with the admin `finance` role maps to merchant role `finance`, and `requireMerchantWriterActor` turned it into a normal `merchant_session`, so an impersonating admin could capture/void/create links and webhooks, recorded as the merchant (comment said "impersonation can't reach write routes") | `auth/requireMerchantAuth.ts` | `requireMerchantWriterActor` throws 403 for `admin_impersonation`, one central place for every write route |
+| 25 | Cancelling a payment link used only the link id: merchant A could cancel merchant B's link (the route checked the URL merchant, not the link's owner) | `paymentLinks/cancel.ts` | UPDATE and lookup also filter `merchant_id` from auth; other merchant's id now gives 404 |
+
+Tests: `apps/api/src/routes/authz.test.ts` (3 tests, all failed before the fixes).
