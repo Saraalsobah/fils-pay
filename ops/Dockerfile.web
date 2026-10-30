@@ -1,0 +1,19 @@
+# Builds apps/web and apps/admin into static files and serves them with Caddy, which also
+# terminates HTTPS and proxies /v1 to the api. Build context = repo root.
+FROM node:20 AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+COPY apps ./apps
+COPY packages ./packages
+RUN npm ci
+ARG DOMAIN
+# Empty API base = same-origin calls to /v1 (Caddy proxies them), so session cookies just work.
+ENV VITE_API_BASE_URL=""
+ENV VITE_ADMIN_API_BASE_URL=""
+ENV VITE_WEB_BASE_URL="https://${DOMAIN}"
+RUN npm run build -w apps/web && npm run build -w apps/admin
+
+FROM caddy:2-alpine
+COPY --from=build /app/apps/web/dist /srv/web
+COPY --from=build /app/apps/admin/dist /srv/admin
+COPY ops/Caddyfile /etc/caddy/Caddyfile

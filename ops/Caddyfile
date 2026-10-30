@@ -1,0 +1,28 @@
+# DOMAIN is e.g. 165-232-189-108.sslip.io (a public name that resolves to the server's IP, so
+# Let's Encrypt can issue a real certificate without owning a domain).
+{$DOMAIN} {
+	encode gzip
+	handle /v1/* {
+		reverse_proxy api:3000
+	}
+	handle /health {
+		reverse_proxy api:3000
+	}
+	handle {
+		root * /srv/web
+		try_files {path} /index.html
+		file_server
+	}
+}
+
+admin.{$DOMAIN} {
+	encode gzip
+	handle /v1/* {
+		reverse_proxy api:3000
+	}
+	handle {
+		root * /srv/admin
+		try_files {path} /index.html
+		file_server
+	}
+}
