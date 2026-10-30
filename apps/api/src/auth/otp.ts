@@ -37,7 +37,7 @@ export interface IssuedOtpChallenge {
  */
 export async function issueChallenge(
   client: PoolClient,
-  params: { merchantUserId: string; ttlMinutes: number; codeLength: number; maxAttempts: number },
+  params: { merchantUserId: string; ttlMinutes: number; codeLength: number; maxAttempts: number; attemptCount?: number },
 ): Promise<IssuedOtpChallenge> {
   const code = generateOtpCode(params.codeLength);
   const salt = randomBytes(16).toString("hex");
@@ -45,10 +45,10 @@ export async function issueChallenge(
   const expiresAt = new Date(Date.now() + params.ttlMinutes * 60_000);
 
   const result = await client.query<{ id: string }>(
-    `INSERT INTO otp_challenges (merchant_user_id, code_salt, code_hash, expires_at, max_attempts)
-     VALUES ($1, $2, $3, $4, $5)
+    `INSERT INTO otp_challenges (merchant_user_id, code_salt, code_hash, expires_at, max_attempts, attempt_count)
+     VALUES ($1, $2, $3, $4, $5, $6)
      RETURNING id`,
-    [params.merchantUserId, salt, hash, expiresAt, params.maxAttempts],
+    [params.merchantUserId, salt, hash, expiresAt, params.maxAttempts, params.attemptCount ?? 0],
   );
   const row = result.rows[0];
   if (!row) {

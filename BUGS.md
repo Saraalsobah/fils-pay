@@ -276,3 +276,16 @@ capture, refund, close and payout the cached balance and the balance rebuilt fro
   so that test fails (it also fails without our changes).
 - `merchants.refunds_enabled`: the comment in migration 0052 says NULL means "disabled", the code and
   its other comment treat NULL as "no hold". We left the code as is.
+
+## Login / OTP security (bugs 17-22)
+
+| # | Bug | Where | Fix |
+|---|-----|-------|-----|
+| 17 | A password-only (pre-OTP) session cookie was accepted as a full login: `live_sessions` view has no `authenticated = true` filter, so the OTP step could be skipped entirely | `auth/sessions.ts` `lookupSession` | added `AND s.authenticated = true` |
+| 18 | OTP was sent to / session created for `findOtpRecipient(email)` = first user with that email across ALL merchants, so logging into merchant B could give a session for merchant A | `routes/auth.ts` login | recipient is the user that passed the password check |
+| 19 | Attempt limit was check-then-increment: 40 parallel wrong guesses all read `attempt_count = 0`, so the 5-guess limit did not hold (6-digit code brute-forceable). Same race on admin login, whose comment wrongly said the row was locked | `routes/auth.ts`, `routes/adminAuth.ts` `/otp/verify` | one atomic `UPDATE ... SET attempt_count = attempt_count + 1 WHERE attempt_count < max_attempts` reserves the guess before the code is checked |
+| 20 | "Resend" reset the guess budget (comment claimed it inherits attempt_count; code did not), giving unlimited guesses | `auth/otp.ts` `issueChallenge`, `routes/auth.ts` resend | new challenge inherits the old `attempt_count` |
+| 21 | OTP codes and payment-link tokens came from `Math.random()` (predictable, not a CSPRNG) | `lib/random.ts` | `crypto.randomInt` |
+| 22 | `OTP_DEV_EXPOSE=true` in production returned the login code in the API response | `config.ts` | `loadConfig` refuses to start in production with it on |
+
+Tests: `apps/api/src/routes/authOtp.test.ts` (7 tests, 6 failed before the fixes).

@@ -190,6 +190,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
 
   const acquirerCallbackSigningSecret = env.ACQUIRER_CALLBACK_SIGNING_SECRET ?? "";
+  if (nodeEnv === "production" && parseBoolEnv(env.OTP_DEV_EXPOSE, false)) {
+    throw new Error("loadConfig: OTP_DEV_EXPOSE must not be enabled when NODE_ENV=production (it returns the login code in the API response)");
+  }
   if (nodeEnv === "production" && acquirerCallbackSigningSecret === "") {
     throw new Error("loadConfig: ACQUIRER_CALLBACK_SIGNING_SECRET is required when NODE_ENV=production");
   }

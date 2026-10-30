@@ -144,18 +144,20 @@ export async function adminAuthRoutes(app: FastifyInstance): Promise<void> {
       throw new GoneError("otp_expired");
     }
 
-    // admin path doesn't have the merchant race, the challenge row is read FOR UPDATE — MK
-    if (challenge.attempt_count >= challenge.max_attempts) {
+    // The row is NOT locked by the plain SELECT above, so reserve the guess
+    // atomically before checking the code (parallel requests otherwise all see 0).
+    const reserved = await app.db.query(
+      `UPDATE admin_otp_challenges SET attempt_count = attempt_count + 1
+        WHERE id = $1 AND consumed_at IS NULL AND attempt_count < max_attempts`,
+      [challenge.id],
+    );
+    if (reserved.rowCount === 0) {
       await revokeAdminSession(app.db, pending.adminSessionId);
       throw new TooManyRequestsError("too_many_attempts");
     }
 
     const matches = verifyOtpCode(code, challenge.code_salt, challenge.code_hash);
     if (!matches) {
-      await app.db.query(
-        `UPDATE admin_otp_challenges SET attempt_count = attempt_count + 1 WHERE id = $1`,
-        [challenge.id],
-      );
       throw new UnauthorizedError("invalid_code");
     }
 
