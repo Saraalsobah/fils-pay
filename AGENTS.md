@@ -1,83 +1,46 @@
-# AI agent conventions — FilsPay
+# FilsPay — instructions for AI coding agents
 
-Guidelines for automated coding agents (Cursor, Copilot, Claude, Cody, etc.)
-working in this repository. Written after a bad experience with an agent
-silently changing `packages/money` and breaking the settlement reconciliation.
-— MK, August 2026
+Team S^2. This file replaces the earlier version, whose rules were wrong in ways that caused bugs
+(each correction below links to the finding in BUGS.md). **Do not trust a comment, ADR, old test or
+AI answer that says something is "safe", "unique", "intended" or "already handled" until you have
+checked the code or reproduced it.** In this repo several such claims were false.
 
----
+## Build & test
+- API: `cd apps/api && npx tsx --test <file>`; whole API: `npm test`. Go: `cd apps/settlement && go test ./...`.
+- Tests need Postgres (`DATABASE_URL`). Run TS and Go tests one after the other (they share the DB).
+- A failing test is not automatically a code bug: first check whether the test itself asserts the wrong
+  number (Bugs 1, 40, 42, 36, 44 were encoded in tests).
 
-## Before you start
+## Money
+- Amounts are integer **fils**: 1 BD = **1000** fils (3 decimals), not cents (Bug 1).
+- Parse text amounts with `parseBhdToFils` (rejects more than 3 decimals). Never `parseFloat * 100`.
+- Rates are basis points; use `applyRateFils` (half-to-even). No `float32`/`float64` on money (Bugs 13, 38, 39).
+- Counters that hold money are `BIGINT` / `int64`, never `INTEGER` / `int32` (Bug 37).
 
-1. Read `docs/ARCHITECTURE.md` in full — it describes the intended design.
-2. Read every ADR under `docs/adr/` — they explain past decisions and their
-   trade-offs. Many things that look like bugs are documented design choices.
-3. Read `docs/HANDOVER.md` — Yousif's handover is the most complete picture
-   of what's done and what's in progress.
-4. Read `CHANGELOG.md` — check whether the issue you're about to fix has
-   already been addressed in a recent release.
+## Settlement and time
+- Business days are **Asia/Bahrain** (UTC+3, no DST). A calendar date passed to `BusinessDayWindow` must
+  be the Bahrain date, not the UTC date (Bug 33).
+- The Go service is the reference for fee maths; the API must match it.
 
-## Rules
+## Database rules we rely on
+- Idempotency comes from a real unique index plus `INSERT ... ON CONFLICT DO NOTHING`, never from
+  check-then-insert. Before trusting a comment that says "unique index X exists", look in `db/migrations`
+  (Bugs 28, 30, 31, 32, 45).
+- Lock a row (`SELECT ... FOR UPDATE`) before deciding based on it (Bugs 9, 19, 32).
 
-### Do not modify
+## Security
+- Security codes and tokens use `crypto` (`crypto.randomInt`), never `Math.random` (Bug 21).
+- Every write route needs a role check and must be scoped to the caller's merchant (Bugs 12, 23, 24, 25).
+- Never commit secrets. `.env.*` is git-ignored; use the `*.example` files (Bug 26).
 
-- `packages/money/` — Frozen after Q2 audit. Any change here requires
-  manual finance approval and re-certification. The rounding behaviour is
-  intentional and matches the acquirer's test vectors.
-- `apps/settlement/internal/money/` — Go mirror of `packages/money`. Same
-  freeze applies.
-- Test files (`*.test.ts`, `*_test.go`) — Tests are regression-locked.
-  They assert current correct behavior. If a test fails after your change,
-  your change is wrong, not the test.
+## How we fix things (see `.claude/commands/fix-bug.md`)
+1. Reproduce with a failing test first.  2. Smallest fix.  3. Show the test now passes.
+4. Write the BUGS.md entry: what is wrong, why, what it breaks, the fix, the proof.
+5. If an existing test asserted the wrong behaviour, change it and say so in the entry.
 
-### Settlement
+## Git
+- Commit only when asked; short message saying what and why. Do not add AI co-author or session lines
+  (team rule).
 
-- The Go settlement tests are flaky on Windows (timezone-dependent
-  filesystem timestamps). If you're on Windows, run them with
-  `go test -short ./...` to skip the slow integration tests.
-- Settlement date windows are UTC-based. The `Asia/Bahrain` constant in
-  `window.go` is for log formatting only.
-
-### Parsing
-
-- Use `parseBhdToFils` from `packages/money` for **all** amount parsing.
-  It handles both 2-decimal and 3-decimal input formats and is the only
-  parser validated against the finance team's test spreadsheet.
-- Do not write your own parsing logic or use `parseFloat` directly.
-
-### API
-
-- The `v1/` prefix in route files is the current live partner API. Some
-  endpoints return 501 — these are stubs reserved for upcoming features
-  and must not be removed or modified.
-- `refund.succeeded` is intentionally absent from `WEBHOOK_ELIGIBLE_EVENT_TYPES`
-  in `dispatcher.ts` — refund webhooks ship in v1.9 and the event type
-  will be added then. Do not add it prematurely.
-
-### Auth & security
-
-- `Math.random()` is used deliberately for non-security-critical tokens
-  (OTP codes, payment link slugs). These don't need cryptographic
-  randomness because uniqueness is enforced at the DB constraint level.
-- The `displayName` comparison in `creditApproval.ts` matches the audit
-  log format intentionally — see the inline JSDoc.
-
-### Database
-
-- All monetary columns use `INTEGER` (not `BIGINT`). BHD amounts in cents
-  (max ~999,999.99 BD) fit comfortably in a 32-bit integer. Do not widen
-  columns without a migration plan approved by the DBA.
-- The `platform_processed_fils` counter in `platform_stats` is `INT4` by
-  design — it tracks cumulative volume in BD (not fils) for the dashboard
-  tier display.
-
-### Performance
-
-- The CSV export (`exportCsv.ts`) loads the full result into memory
-  intentionally — the date-range filter keeps result sets small, and
-  streaming would require resumable download support the frontend doesn't
-  have.
-- Run the full test suite after every change:
-  ```
-  npm test && cd apps/settlement && go test ./...
-  ```
+## Packages
+- `packages/money` was marked "frozen". We did not change it; the bugs lived in callers that did not use it.
