@@ -480,3 +480,33 @@ test("GET /v1/settlement/reconciliation succeeds for a 'finance' session role", 
   });
   assert.equal(res.statusCode, 200, res.body);
 });
+
+/** FP-300: a refund no batch has netted yet is pending, not an unexplained gap. */
+test("GET /v1/settlement/reconciliation still explains to zero when a refund is not yet batched", async () => {
+  const { rawKey } = await createApprovedMerchantWithApiKey("reconciliation-refund-pending", 250);
+  const txn = await authorize(rawKey, 10_000);
+  await capture(rawKey, txn.id);
+  const refundRes = await app.inject({
+    method: "POST",
+    url: "/v1/refunds",
+    headers: { ...authHeader(rawKey), "idempotency-key": randomUUID() },
+    payload: { transactionId: txn.id, amountFils: 4_000 },
+  });
+  assert.equal(refundRes.statusCode, 200, refundRes.body);
+  assert.equal(refundRes.json().feeReversedFils, 100);
+
+  const businessDate = todayBahrainDateString();
+  const res = await app.inject({
+    method: "GET",
+    url: `/v1/settlement/reconciliation?from=${businessDate}&to=${addOneCalendarDay(businessDate)}`,
+    headers: authHeader(rawKey),
+  });
+  assert.equal(res.statusCode, 200, res.body);
+  const report = res.json() as { gapFils: number; explained: boolean; pendingUnbatchedFils: number; ledgerMerchantPayableNetFils: number };
+
+  // captured 10,000 - fee 250 = 9,750 pending; the refund will take back 4,000 - 100 = 3,900.
+  assert.equal(report.ledgerMerchantPayableNetFils, 5_850);
+  assert.equal(report.pendingUnbatchedFils, 5_850);
+  assert.equal(report.gapFils, 0);
+  assert.equal(report.explained, true);
+});

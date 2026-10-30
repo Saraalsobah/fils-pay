@@ -33,6 +33,11 @@ type BatchResult struct {
 	NetPayoutFils money.Fils
 	EventCount    int
 	LineCount     int
+	// Refunds this batch claimed and netted off the payout (FP-300).
+	// NetPayoutFils = GrossFils - FeeFils - RefundFils + RefundFeeReversedFils.
+	RefundCount           int
+	RefundFils            money.Fils
+	RefundFeeReversedFils money.Fils
 }
 
 // PayoutResult is PayoutBatch's return value.
@@ -93,21 +98,29 @@ func CloseBatch(ctx context.Context, db *pgxpool.Pool, merchantID uuid.UUID, bus
 	// Step 4: already closed/paid -> idempotent no-op, nothing to undo.
 	if status != "open" {
 		tx.Rollback(ctx) //nolint:errcheck
-		var gross, fee, net int64
+		var gross, fee, net, refunds, refundFeeBack int64
 		err = db.QueryRow(ctx, `
-			SELECT gross_fils, fee_fils, net_payout_fils FROM settlement_batches WHERE id = $1
-		`, batchID).Scan(&gross, &fee, &net)
+			SELECT gross_fils, fee_fils, net_payout_fils, refunds_fils, refund_fee_reversed_fils
+			  FROM settlement_batches WHERE id = $1
+		`, batchID).Scan(&gross, &fee, &net, &refunds, &refundFeeBack)
 		if err != nil {
 			return BatchResult{}, fmt.Errorf("settlement: CloseBatch: read already-closed batch: %w", err)
 		}
+		refundCount := 0
+		if err := db.QueryRow(ctx, `SELECT count(*) FROM refunds WHERE settlement_batch_id = $1`, batchID).Scan(&refundCount); err != nil {
+			return BatchResult{}, fmt.Errorf("settlement: CloseBatch: count batch refunds: %w", err)
+		}
 		return BatchResult{
-			BatchID:       batchID,
-			MerchantID:    merchantID,
-			BatchDate:     batchDateOnly,
-			AlreadyClosed: true,
-			GrossFils:     money.Fils(gross),
-			FeeFils:       money.Fils(fee),
-			NetPayoutFils: money.Fils(net),
+			BatchID:               batchID,
+			MerchantID:            merchantID,
+			BatchDate:             batchDateOnly,
+			AlreadyClosed:         true,
+			GrossFils:             money.Fils(gross),
+			FeeFils:               money.Fils(fee),
+			NetPayoutFils:         money.Fils(net),
+			RefundCount:           refundCount,
+			RefundFils:            money.Fils(refunds),
+			RefundFeeReversedFils: money.Fils(refundFeeBack),
 		}, nil
 	}
 
@@ -216,7 +229,59 @@ func CloseBatch(ctx context.Context, db *pgxpool.Pool, merchantID uuid.UUID, bus
 		batchGross += grossForTxn
 		batchFee += feeForTxn
 	}
-	netPayout := NetPayableFils(batchGross, batchFee)
+	capturesNet := NetPayableFils(batchGross, batchFee)
+
+	// Refunds (FP-300). Every succeeded refund of this merchant that no batch
+	// has claimed yet, up to the end of this business day, comes off the
+	// payout: the merchant gets back the refund minus the MDR that was given
+	// back with it. They are taken oldest first and the walk stops at the
+	// first one the day's money cannot cover, so the payout never goes
+	// negative and a refund is never lost: whatever is left stays unclaimed
+	// (refunds.settlement_batch_id IS NULL) for the next batch.
+	refundRows, err := tx.Query(ctx, `
+		SELECT id, amount_fils, fee_reversed_fils
+		  FROM refunds
+		 WHERE merchant_id = $1 AND status = 'succeeded'
+		   AND settlement_batch_id IS NULL AND occurred_at < $2
+		 ORDER BY occurred_at, id
+		 FOR UPDATE
+	`, merchantID, end)
+	if err != nil {
+		return BatchResult{}, fmt.Errorf("settlement: CloseBatch: select unbatched refunds: %w", err)
+	}
+	type pendingRefund struct {
+		id                uuid.UUID
+		amountFils        int64
+		feeReversedFils   int64
+	}
+	var pendingRefunds []pendingRefund
+	for refundRows.Next() {
+		var r pendingRefund
+		if err := refundRows.Scan(&r.id, &r.amountFils, &r.feeReversedFils); err != nil {
+			refundRows.Close()
+			return BatchResult{}, fmt.Errorf("settlement: CloseBatch: scan refund: %w", err)
+		}
+		pendingRefunds = append(pendingRefunds, r)
+	}
+	if err := refundRows.Err(); err != nil {
+		return BatchResult{}, fmt.Errorf("settlement: CloseBatch: iterate refunds: %w", err)
+	}
+	refundRows.Close()
+
+	available := int64(capturesNet)
+	var refundGross, refundFeeBack money.Fils
+	var refundIDs []string
+	for _, r := range pendingRefunds {
+		cost := r.amountFils - r.feeReversedFils
+		if cost > available {
+			break
+		}
+		available -= cost
+		refundGross += money.Fils(r.amountFils)
+		refundFeeBack += money.Fils(r.feeReversedFils)
+		refundIDs = append(refundIDs, r.id.String())
+	}
+	netPayout := capturesNet - (refundGross - refundFeeBack)
 
 	// Record this batch's contribution to the platform-wide lifetime
 	// processed-volume counter, in the same transaction that freezes this
@@ -229,9 +294,10 @@ func CloseBatch(ctx context.Context, db *pgxpool.Pool, merchantID uuid.UUID, bus
 	// Step 10: freeze the batch totals.
 	_, err = tx.Exec(ctx, `
 		UPDATE settlement_batches
-		   SET status = 'closed', gross_fils = $2, fee_fils = $3, net_payout_fils = $4, closed_at = now()
+		   SET status = 'closed', gross_fils = $2, fee_fils = $3, net_payout_fils = $4, closed_at = now(),
+		       refunds_fils = $5, refund_fee_reversed_fils = $6
 		 WHERE id = $1
-	`, batchID, int64(batchGross), int64(batchFee), int64(netPayout))
+	`, batchID, int64(batchGross), int64(batchFee), int64(netPayout), int64(refundGross), int64(refundFeeBack))
 	if err != nil {
 		return BatchResult{}, fmt.Errorf("settlement: CloseBatch: freeze batch totals: %w", err)
 	}
@@ -244,6 +310,15 @@ func CloseBatch(ctx context.Context, db *pgxpool.Pool, merchantID uuid.UUID, bus
 		`, eventIDs, batchID)
 		if err != nil {
 			return BatchResult{}, fmt.Errorf("settlement: CloseBatch: mark events batched: %w", err)
+		}
+	}
+
+	// Mark every netted refund as claimed, in the same transaction, so no
+	// other batch can net it again.
+	if len(refundIDs) > 0 {
+		_, err = tx.Exec(ctx, `UPDATE refunds SET settlement_batch_id = $2 WHERE id = ANY($1::uuid[])`, refundIDs, batchID)
+		if err != nil {
+			return BatchResult{}, fmt.Errorf("settlement: CloseBatch: mark refunds batched: %w", err)
 		}
 	}
 
@@ -291,6 +366,10 @@ func CloseBatch(ctx context.Context, db *pgxpool.Pool, merchantID uuid.UUID, bus
 		NetPayoutFils: netPayout,
 		EventCount:    len(eventIDs),
 		LineCount:     len(lines),
+
+		RefundCount:           len(refundIDs),
+		RefundFils:            refundGross,
+		RefundFeeReversedFils: refundFeeBack,
 	}, nil
 }
 
