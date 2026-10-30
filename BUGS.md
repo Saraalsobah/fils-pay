@@ -11,6 +11,7 @@ and how the fix was checked. "Fixed" means a code change plus tests.
 | 3 | Migration 0055 cannot apply on a fresh database | `db/migrations/0055_chart_of_accounts_suspense.sql` | Fixed |
 | 4 | The built-in dev webhook key is invalid, so the API and the seed refuse to start | `apps/api/src/config.ts` | Worked around |
 | 5 | A payment link can be paid after it has expired (FP-187) | `apps/api/src/routes/paymentLinks.ts` | Fixed |
+| 6 | Split payouts do not add up to the net payout | `apps/settlement/internal/splits/` | Fixed |
 
 Fixes for bugs 1-3 are in commit `12fdf81` (it also contains our local setup files). Bug 5 is in its own commit.
 
@@ -131,6 +132,18 @@ tests pass, and the api and web typechecks are clean.
 
 ---
 
+## Bug 6: Split payouts are a few fils off
+
+**What is wrong.** When a parent merchant (e.g. Delta Marketplace) is paid out, its net payout is split between its child merchants by weight. Each child's share was rounded on its own with `ApplyRateFils`, so the shares did not add up to the payout.
+
+**Why.** Rounding each piece separately cannot keep the total. 100 fils split in thirds gives 33 + 33 + 33 = 99, so 1 fil vanishes. 7 fils split in quarters gives 2 + 2 + 2 + 2 = 8, so 1 fil is invented. The existing test only used amounts that divide evenly, so it never caught this. A second flaw: the parent's cached balance was lowered by the sum of the shares, not by the batch's net payout, so any error also made the cache drift. The weights were never checked to sum to 10000 bps either (FP-250).
+
+**What it breaks.** Merchants are paid a few fils too little or too much on every uneven split, and the ledger, `settlement_batch_splits` and the batch no longer reconcile. It is the "splits always a few fils short" item on the finance memo.
+
+**Fix.** `ChildShares` now uses largest-remainder allocation: everyone gets the whole-fils part, and the leftover fils go one each to the biggest fractional remainders (ties to the earlier child, so it is deterministic). `PayoutSplitBatch` refuses to pay if the weights do not sum to 10000, checks that the shares equal the net payout, and lowers the cache by the net payout.
+
+**Evidence.** New tests `TestChildShares_UnevenAmountsStillSumToNet`, `TestChildShares_Deterministic` and `TestValidateWeights`. Before the fix 6 of 8 uneven cases failed; afterwards all pass.
+
 ## Setup problems found (not app bugs)
 
 - `ops/Dockerfile.node` and `ops/Dockerfile.go` are referenced by the compose file and the ops
@@ -139,6 +152,8 @@ tests pass, and the api and web typechecks are clean.
   proxy in both Vite configs (with `.env.local` files setting the API base URL to empty).
 
 ## Leads: read in the code, not yet reproduced or fixed
+
+- Split payout path does not call `UpdateLifetimePayoutMonitoringEstimate` (the normal `PayoutBatch` does), and `ApplyPayout` silently does nothing if a merchant has no `merchant_balances` row.
 
 - OTP codes come from `Math.random()` (`apps/api/src/lib/random.ts`).
 - Two-person credit approval compares `displayName` instead of the admin user id.
