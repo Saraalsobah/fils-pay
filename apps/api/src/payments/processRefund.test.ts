@@ -478,3 +478,132 @@ test("unknown transaction ids answer 404", async () => {
   assert.equal(result.statusCode, 404);
   assert.deepEqual(result.body, { error: "transaction_not_found" });
 });
+
+// ---- Refund audit regressions -------------------------------------------
+
+/** Refunds are bounded by what was CAPTURED, not by what was authorized. */
+test("a partially captured transaction cannot refund more than it captured", async () => {
+  const merchant = await createApprovedMerchantWithApiKey("refund-ceiling");
+  const txn = await capturedTransaction(merchant.rawKey, 10_000, 4_000);
+  const actor = await apiKeyActor(merchant.merchantId);
+
+  const tooMuch = await processRefund(pool, approvingAcquirer, {
+    transactionId: txn.id,
+    merchantId: merchant.merchantId,
+    amountFils: toFils(6_000),
+    idempotencyKey: randomUUID(),
+    actor,
+  });
+  assert.equal(tooMuch.statusCode, 422, JSON.stringify(tooMuch.body));
+  assert.deepEqual(tooMuch.body, { ok: false, code: "refund_exceeds_refundable", refundableFils: 4_000 });
+
+  const refunds = await pool.query(`SELECT 1 FROM refunds WHERE transaction_id = $1`, [txn.id]);
+  assert.equal(refunds.rows.length, 0);
+});
+
+/** Finance rule: a transaction is "refunded" once every fils CAPTURED has gone back. */
+test("refunding everything captured on a partially captured transaction lands on refunded", async () => {
+  const merchant = await createApprovedMerchantWithApiKey("refund-partial-capture");
+  const txn = await capturedTransaction(merchant.rawKey, 10_000, 4_000);
+  const actor = await apiKeyActor(merchant.merchantId);
+
+  const result = await processRefund(pool, approvingAcquirer, {
+    transactionId: txn.id,
+    merchantId: merchant.merchantId,
+    amountFils: toFils(4_000),
+    idempotencyKey: randomUUID(),
+    actor,
+  });
+  assert.equal(result.statusCode, 200, JSON.stringify(result.body));
+
+  const row = await pool.query<{ status: string }>(`SELECT status FROM transactions WHERE id = $1`, [txn.id]);
+  assert.equal(row.rows[0]!.status, "refunded");
+
+  // ...and the transaction is not refundable a second time.
+  const again = await processRefund(pool, approvingAcquirer, {
+    transactionId: txn.id,
+    merchantId: merchant.merchantId,
+    amountFils: toFils(1),
+    idempotencyKey: randomUUID(),
+    actor,
+  });
+  assert.equal(again.statusCode, 409, JSON.stringify(again.body));
+});
+
+/** FP-209: many refunds racing on one transaction must not together exceed what was captured. */
+test("concurrent refunds cannot together exceed the captured amount (FP-209)", async () => {
+  const merchant = await createApprovedMerchantWithApiKey("refund-race");
+  const txn = await capturedTransaction(merchant.rawKey, 10_000);
+  const actor = await apiKeyActor(merchant.merchantId);
+
+  const results = await Promise.all(
+    Array.from({ length: 6 }, () =>
+      processRefund(pool, approvingAcquirer, {
+        transactionId: txn.id,
+        merchantId: merchant.merchantId,
+        amountFils: toFils(3_000),
+        idempotencyKey: randomUUID(),
+        actor,
+      }),
+    ),
+  );
+  const succeeded = results.filter((r) => r.statusCode === 200).length;
+  assert.equal(succeeded, 3, `expected exactly 3 refunds of 3000 to fit in 10000, got ${succeeded}`);
+
+  const row = await pool.query<{ refunded_fils: string }>(`SELECT refunded_fils FROM transactions WHERE id = $1`, [
+    txn.id,
+  ]);
+  assert.equal(Number(row.rows[0]!.refunded_fils), 9_000);
+  const sum = await pool.query<{ total: string }>(
+    `SELECT COALESCE(SUM(amount_fils), 0)::text AS total FROM refunds WHERE transaction_id = $1`,
+    [txn.id],
+  );
+  assert.equal(Number(sum.rows[0]!.total), 9_000);
+});
+
+/** Reversing the fee per partial refund drifts by rounding; the pieces must add up to the fee charged. */
+test("fee reversed across uneven partial refunds adds up to the fee charged", async () => {
+  const merchant = await createApprovedMerchantWithApiKey("refund-fee-sum");
+  const txn = await capturedTransaction(merchant.rawKey, 999);
+  const actor = await apiKeyActor(merchant.merchantId);
+
+  for (let i = 0; i < 3; i += 1) {
+    const result = await processRefund(pool, approvingAcquirer, {
+      transactionId: txn.id,
+      merchantId: merchant.merchantId,
+      amountFils: toFils(333),
+      idempotencyKey: randomUUID(),
+      actor,
+    });
+    assert.equal(result.statusCode, 200, JSON.stringify(result.body));
+  }
+
+  const charged = await pool.query<{ fee: string }>(
+    `SELECT COALESCE(SUM(amount_fils), 0)::text AS fee FROM ledger_entries
+      WHERE transaction_id = $1 AND account_id = 'platform_fee_revenue' AND direction = 'credit'`,
+    [txn.id],
+  );
+  const reversed = await pool.query<{ fee: string }>(
+    `SELECT COALESCE(SUM(fee_reversed_fils), 0)::text AS fee FROM refunds WHERE transaction_id = $1`,
+    [txn.id],
+  );
+  assert.ok(Number(charged.rows[0]!.fee) > 0);
+  assert.equal(Number(reversed.rows[0]!.fee), Number(charged.rows[0]!.fee));
+});
+
+/** A refund with no reason is allowed; the reason column defaults to 'unspecified'. */
+test("a refund without a reason is stored with the default reason", async () => {
+  const merchant = await createApprovedMerchantWithApiKey("refund-no-reason");
+  const txn = await capturedTransaction(merchant.rawKey, 5_000);
+  const actor = await apiKeyActor(merchant.merchantId);
+  const result = await processRefund(pool, approvingAcquirer, {
+    transactionId: txn.id,
+    merchantId: merchant.merchantId,
+    amountFils: toFils(1_000),
+    idempotencyKey: randomUUID(),
+    actor,
+  });
+  assert.equal(result.statusCode, 200, JSON.stringify(result.body));
+  const row = await pool.query<{ reason: string }>(`SELECT reason FROM refunds WHERE transaction_id = $1`, [txn.id]);
+  assert.equal(row.rows[0]!.reason, "unspecified");
+});

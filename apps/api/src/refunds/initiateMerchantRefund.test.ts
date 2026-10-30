@@ -167,8 +167,26 @@ test("a partial refund of the caller's own transaction succeeds", async () => {
   assert.equal(Number(row.rows[0]!.refunded_fils), 2_500);
 });
 
-// TODO: another merchant's existing transactionId should also 404. currently refunds it — am
-// FH: Claude wrote a test for this but it passed?? so it's fine. deleted it as redundant
+test("another merchant's existing transactionId is a 404 and refunds nothing", async () => {
+  const owner = await createApprovedMerchantWithApiKey("tenant-owner");
+  const attacker = await createApprovedMerchantWithApiKey("tenant-attacker");
+  const txnId = await capturedTransaction(owner.rawKey, 10_000);
+
+  await assert.rejects(
+    () =>
+      initiateMerchantRefund(pool, approvingAcquirer, {
+        merchantId: attacker.merchantId,
+        transactionId: txnId,
+        idempotencyKey: randomUUID(),
+        actor: attacker.actor,
+      }),
+    NotFoundError,
+  );
+
+  const refunds = await pool.query(`SELECT 1 FROM refunds WHERE transaction_id = $1`, [txnId]);
+  assert.equal(refunds.rows.length, 0);
+});
+
 test("a transactionId that does not exist is a 404, not a 500", async () => {
   const merchant = await createApprovedMerchantWithApiKey("missing-txn");
 
