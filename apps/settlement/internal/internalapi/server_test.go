@@ -415,3 +415,52 @@ func TestServe_ShutsDownWithContext(t *testing.T) {
 		t.Fatal("Serve did not return within 10s of its context being cancelled")
 	}
 }
+
+// The admin "Rebuild cached balances" button must rebuild from the LEDGER (the source
+// of truth for what a merchant is owed), not from scheme-export lines. Export lines are
+// gross, truncated to 2 decimals, and know nothing about fees, refunds, payouts or manual
+// adjustments, so a rebuild from them overwrites a correct cache with a wrong number.
+func TestRebuildBalances_UsesTheLedgerNotSchemeExportLines(t *testing.T) {
+	pool := mustPool(t)
+	server := newTestServer(t, pool)
+	merchantID := insertActiveMerchant(t, pool)
+	ctx := context.Background()
+
+	// Ledger truth: owed 12,000, of which 5,000 was already paid out, so 7,000 is still payable.
+	_, err := pool.Exec(ctx, `
+		INSERT INTO ledger_entries (entry_group_id, merchant_id, account_id, direction, amount_fils, occurred_at, description)
+		VALUES
+		  ('11111111-1111-4111-8111-111111111111', $1, 'card_scheme_clearing', 'debit',  12000, now(), 'capture'),
+		  ('11111111-1111-4111-8111-111111111111', $1, 'merchant_payable',     'credit', 12000, now(), 'capture'),
+		  ('22222222-2222-4222-8222-222222222222', $1, 'merchant_payable',     'debit',   5000, now(), 'payout'),
+		  ('22222222-2222-4222-8222-222222222222', $1, 'platform_cash',      'credit',  5000, now(), 'payout')
+	`, merchantID)
+	if err != nil {
+		t.Fatalf("seed ledger: %v", err)
+	}
+	// The export line only knows the gross capture.
+	var batchID uuid.UUID
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO settlement_batches (merchant_id, batch_date, status, gross_fils, fee_fils, net_payout_fils, closed_at)
+		VALUES ($1, '2026-04-20', 'paid', 12000, 0, 12000, now()) RETURNING id
+	`, merchantID).Scan(&batchID); err != nil {
+		t.Fatalf("seed batch: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO scheme_export_lines (settlement_batch_id, amount_fils, line_sequence) VALUES ($1, 12000, 1)`, batchID); err != nil {
+		t.Fatalf("seed export line: %v", err)
+	}
+
+	resp := post(t, server, "/internal/rebuild-balances", "Bearer "+testToken, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var diffs map[string]rebuildDiffResponse
+	decodeJSON(t, resp, &diffs)
+	diff, ok := diffs[merchantID.String()]
+	if !ok {
+		t.Fatalf("no diff for merchant %s", merchantID)
+	}
+	if diff.After != 7000 {
+		t.Errorf("after = %d, want 7000 (ledger balance), not the gross export total", diff.After)
+	}
+}

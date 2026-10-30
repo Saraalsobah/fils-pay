@@ -364,3 +364,12 @@ Lead (not changed): a rate correction on already-paid days is then never recover
 
 Test: `routes/adminRecomputeSandbox.test.ts` (before: `test_mode` flipped true -> false).
 Lead (not changed): there is still no explicit, audited "go live" action for a sandbox merchant; one should replace the old side effect.
+
+## "Rebuild cached balances" button wrote the wrong balance (bug 36)
+
+| # | Bug | Where | Fix |
+|---|-----|-------|-----|
+| 36 | The admin console's "Rebuild cached balances" (documented as "safe, only rewrites the cache, run it whenever a balance looks off") calls `ledger.RefreshBalanceCache`, which rebuilds each merchant's balance from the view `merchant_payable_position` = sum of `scheme_export_lines`. Export lines are gross, truncated to 2 decimals, and know nothing about fees, refunds, payouts or manual adjustments, so pressing the button overwrote a correct cache with a wrong number for every merchant. The ledger (`merchant_payable` account) is the source of truth; the CLI `rebuild-balances` already used it. A visible test even asserted the export-derived number ("FH: 12000 = export total = what support sees") | `internalapi/server.go` | the endpoint now calls `RebuildAllBalances` (from the ledger). Also fixed the TODO in that function: each cache row is locked `FOR UPDATE` before the ledger is summed, so a concurrent close/payout increment is not clobbered |
+
+Test: `TestRebuildBalances_UsesTheLedgerNotSchemeExportLines` (merchant owed 12,000 with 5,000 already paid out: ledger says 7,000; the button used to write 12,000).
+Not changed: `RefreshBalanceCache` and its two tests are left as they were (nothing calls it any more). ADMIN.md also says "the nightly recompute does the same at 02:00"; nothing in the code does that (lead: do not rely on it).
