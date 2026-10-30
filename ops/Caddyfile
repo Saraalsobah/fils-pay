@@ -5,7 +5,7 @@
 	handle /v1/* {
 		reverse_proxy api:3000
 	}
-	handle /health {
+	handle /healthz {
 		reverse_proxy api:3000
 	}
 	handle {

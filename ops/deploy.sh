@@ -59,8 +59,8 @@ fi
 
 echo "==> 6/6 health"
 for i in $(seq 1 30); do
-  if curl -fsS "https://${DOMAIN}/health" >/dev/null 2>&1; then
-    echo "OK: https://${DOMAIN}/health"; break
+  if curl -fsS "https://${DOMAIN}/healthz" >/dev/null 2>&1; then
+    echo "OK: https://${DOMAIN}/healthz"; break
   fi
   sleep 5
 done
