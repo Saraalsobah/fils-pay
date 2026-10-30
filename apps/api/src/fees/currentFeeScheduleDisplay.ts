@@ -12,19 +12,16 @@ export interface CurrentFeeScheduleDisplay {
 }
 
 /**
- * Fetches the merchant's current negotiated fee schedule for display on the
- * admin merchant-detail page. We only need the newest schedule for display,
- * not point-in-time resolution — an admin looking at this page wants "what
- * did we most recently agree to for this merchant," not "what rate applied
- * to some specific past transaction" (that per-event resolution already
- * exists at capture/settlement time). Ordering by created_at is the
- * simplest way to answer "most recently agreed," since that's literally
- * when the row was entered.
+ * Fetches the rate currently in effect for a merchant, for display on the admin
+ * merchant-detail page. It MUST pick the same row billing does (feeSchedule.ts):
+ * the newest row whose effective_from has arrived, ties broken by created_at.
+ *
+ * It used to order by created_at alone ("most recently agreed"). A backdated
+ * correction entered later (e.g. 245 bps for March onward, keyed in on Aug 15, after the
+ * Aug 1 renegotiation to 225 bps) then displayed as the current rate while every capture and
+ * settlement was actually charging 225, so support told merchants the wrong rate. A row whose
+ * effective_from is in the future is also not "current" yet.
  */
-// MK 15/06/2026: shouldnt this be effective_from <= now() like feeSchedule.ts? a backdated
-// correction entered today would show as "current"
-// FH: asked Claude, it said created_at is right for "most recently agreed" (see docblock). resolved
-// am: display only, nobody bills off this. leave it
 export async function getCurrentFeeScheduleForDisplay(
   pool: Pool,
   merchantId: string,
@@ -32,8 +29,8 @@ export async function getCurrentFeeScheduleForDisplay(
   const result = await pool.query<{ mdr_bps: number; effective_from: Date; created_at: Date }>(
     `SELECT mdr_bps, effective_from, created_at
        FROM fee_schedules
-      WHERE merchant_id = $1
-      ORDER BY created_at DESC
+      WHERE merchant_id = $1 AND effective_from <= now()
+      ORDER BY effective_from DESC, created_at DESC
       LIMIT 1`,
     [merchantId],
   );
