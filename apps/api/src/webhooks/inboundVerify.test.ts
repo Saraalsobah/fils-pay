@@ -46,8 +46,14 @@ test("a malformed header is rejected (malformed_header)", () => {
   assert.equal(verifyAcquirerCallbackSignature(payload, "v1=deadbeef", SECRET).reason, "malformed_header");
 });
 
-test("an unsigned callback is accepted while signature checking is optional", () => {
+test("an unsigned callback is rejected", () => {
   const payload = { callbackId: "acqcb_1", outcome: "cleared" };
   const result = verifyAcquirerCallbackSignature(payload, undefined, SECRET);
-  assert.deepEqual(result, { valid: true });
+  assert.equal(result.valid, false);
+});
+
+test("an empty secret never verifies (an HMAC with an empty key is forgeable by anyone)", () => {
+  const payload = { callbackId: "acqcb_1", outcome: "cleared" };
+  const result = verifyAcquirerCallbackSignature(payload, acquirerHeader(payload, ""), "");
+  assert.equal(result.valid, false);
 });

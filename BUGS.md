@@ -305,3 +305,14 @@ Tests: `apps/api/src/routes/authz.test.ts` (3 tests, all failed before the fixes
 | # | Bug | Where | Fix |
 |---|-----|-----|-----|
 | 26 | `ops/.env.docker` (holds `ACQUIRER_CALLBACK_SIGNING_SECRET`) was committed to git. Its header says "gitignored like .env" and a note says `.env` matches `.env.docker` as a prefix. Both are wrong: a gitignore pattern matches whole names, so only `.env` itself was ignored. Anyone with repo read access (judges, collaborators) can read the secret from history | `.gitignore`, `ops/.env.docker` | `.gitignore` now has `.env.*` (keeping `.env.*.example`); the file is untracked (`git rm --cached`, local copy kept); `ops/.env.docker.example` documents the variables with placeholders. **The old value is still in git history, so it must be treated as leaked: production uses freshly generated secrets, never this value.** |
+
+## Inbound acquirer callbacks (bugs 27-29, FP-201)
+
+| # | Bug | Where | Fix |
+|---|-----|-------|-----|
+| 27 | The public `POST /v1/acquirer/callbacks` accepted **unsigned** requests (`ACQUIRER_CALLBACK_REQUIRE_SIGNATURE` defaulted to false; the app comment "inboundVerify rejects unsigned requests" was false). The signature is the only authentication on that endpoint. Also an **empty secret** (the default outside production) made the HMAC key empty, so anyone could compute a valid signature | `webhooks/inboundVerify.ts`, `routes/acquirerCallbacks.ts`, `config.ts` | signature always required; empty secret never verifies; the optional flag is removed |
+| 28 | Duplicate callbacks were stored again each time (FP-201, the 2026-05-14 incident). The migration comment says a unique index (FP-238) and `processed_events` exist; neither does | `db/migrations/0074`, `acquirer/callbacks.ts` | existing duplicates removed (earliest kept), `UNIQUE (callback_id)`, insert uses `ON CONFLICT DO NOTHING`, so a redelivery returns 200 without a second row |
+| 29 | `outcome` was not validated (comment said it was), any string was stored | `routes/acquirerCallbacks.ts` | 400 unless `cleared` or `confirmed_fraud` |
+
+Checked and fine: outbound `webhooks/sign.ts` (HMAC over `timestamp.canonicalJson`, constant-time compare). The comment worrying about a timing oracle on the timestamp is not a real problem because the timestamp is inside the MAC.
+Not changed (lead): inbound callbacks have no freshness window; with the unique index a replay is now harmless (it only appends an informational note).

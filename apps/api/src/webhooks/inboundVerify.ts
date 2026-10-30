@@ -42,18 +42,19 @@ function constantTimeEquals(a: string, b: string): boolean {
     Buffer.compare(Buffer.from(a), Buffer.from(b)) === 0;
 }
 
-/** Verifies the acquirer callback signature when present and required. */
+/**
+ * Verifies the acquirer callback signature. The signature is the only
+ * authentication on the public callback endpoint, so it is ALWAYS required:
+ * a missing header, or an empty secret (an HMAC with an empty key can be
+ * computed by anyone), never verifies.
+ */
 export function verifyAcquirerCallbackSignature(
   payload: unknown,
   header: string | undefined,
   secret: string,
-  requireSignature = false,
 ): VerifyAcquirerCallbackResult {
-  if (!header) {
-    return requireSignature
-      ? { valid: false, reason: "malformed_header" }
-      : { valid: true };
-  }
+  if (!header) return { valid: false, reason: "malformed_header" };
+  if (secret === "") return { valid: false, reason: "signature_mismatch" };
 
   const parsed = parseAcquirerSignatureHeader(header);
   if (!parsed) return { valid: false, reason: "malformed_header" };

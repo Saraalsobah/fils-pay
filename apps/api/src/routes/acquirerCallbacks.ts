@@ -54,11 +54,14 @@ export async function acquirerCallbackRoutes(app: FastifyInstance): Promise<void
       );
     }
 
+    if (body.outcome !== "cleared" && body.outcome !== "confirmed_fraud") {
+      throw new BadRequestError("invalid_request", "outcome must be 'cleared' or 'confirmed_fraud'");
+    }
+
     const verification = verifyAcquirerCallbackSignature(
       body,
       getSignatureHeader(request),
       app.config.acquirerCallbackSigningSecret,
-      app.config.acquirerCallbackRequireSignature,
     );
     if (!verification.valid) {
       throw new UnauthorizedError("invalid_signature", verification.reason);
