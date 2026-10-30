@@ -337,3 +337,12 @@ Lead (not changed): the disbursement is only recorded when a webhook delivery ru
 
 Test: `paymentLinks/payRace.test.ts` (failed before: `[200,200]`; now one 200, one 409, net captured = one link amount).
 Note: the postmortem root cause (duplicate callbacks) was real but is a separate bug (27/28); callbacks only append informational notes and never touched link status.
+
+## Daily close runs at 3am instead of just after midnight (bug 33)
+
+| # | Bug | Where | Fix |
+|---|-----|-------|-----|
+| 33 | The daemon passed `time.Now().UTC()` to `BusinessDayWindow`, which reads the calendar date in the argument's own zone. Between 00:00 and 03:00 Bahrain (21:00-24:00 UTC) the UTC date is still the previous day, so the daemon believed it was a day earlier: it "closed" the already-closed previous date and the real close only ran after 03:00 Bahrain, when the UTC date flipped. Matches the logs ("close ~03:15 local not 00:15") that AM dismissed with "whatever, it runs", and MK's comment "UTC here is fine, BusinessDayWindow converts to Bahrain" is false (it does not convert; its argument is a calendar date) | `scheduler/daemon.go`, `settlement/window.go` | new `BahrainCalendarDate(now)` and a pure `dueBusinessDate(now, delay)`; the daemon decides "today" from the Bahrain date |
+
+Test: `scheduler/daemon_test.go` `TestDueBusinessDate` (fails on the old logic: due during the grace period, wrong date at 00:15 and 02:59 Bahrain).
+Deliberately NOT changed: `BusinessDayWindow` itself keeps its calendar-date contract (the CLI `--date` and the existing window tests depend on it); the fix is in the caller. The "restart at 00:05 closes early" claim in a comment is false: the boot run goes through the same due check.

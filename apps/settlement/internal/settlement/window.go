@@ -34,6 +34,15 @@ func mustLoadLocation(name string) *time.Location {
 	return loc
 }
 
+// BahrainCalendarDate returns the Asia/Bahrain calendar date of the instant `now`,
+// as a date at 00:00 UTC (the calendar-date form BusinessDayWindow and RunDailyBatch
+// take). Needed because `now.Date()` reads the date in now's own zone: between
+// 21:00 and 24:00 UTC the UTC date is still "yesterday" in Bahrain.
+func BahrainCalendarDate(now time.Time) time.Time {
+	y, m, d := now.In(businessDayLocation).Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+}
+
 // BusinessDayWindow returns the [start, end) UTC instants bounding the
 // given calendar date's Asia/Bahrain business day, i.e. Asia/Bahrain
 // 00:00:00 on `date` through Asia/Bahrain 00:00:00 on `date`+1.
