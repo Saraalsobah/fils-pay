@@ -148,7 +148,9 @@ function parseBoolEnv(value: string | undefined, fallback: boolean): boolean {
   return value === "true" || value === "1";
 }
 
-const DEV_FALLBACK_WEBHOOK_KEY_B64 = "dGVzdC1rZXktZm9yLWRldi1vbmx5LW5vdC1mb3ItcHJvZA==";
+// Must decode to EXACTLY 32 bytes (the old value was 34, so the api crashed at boot on a fresh
+// local run). Dev/test only: production refuses to use it (see the nodeEnv check below).
+const DEV_FALLBACK_WEBHOOK_KEY_B64 = "Zmlsc3BheS1sb2NhbC1kZXYta2V5LTMyLWJ5dGVzISE=";
 
 const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 
