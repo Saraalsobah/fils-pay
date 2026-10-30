@@ -29,8 +29,11 @@ interface LinkStatusRow {
   expires_at: Date;
 }
 
-/** A pay request is judged against when the buyer pressed pay, so a
- * retry that lands after midnight is not penalised. */
+/**
+ * The instant a pay request is judged against for expiry. Only pass a
+ * `submittedAt` that comes from a trusted source. The public pay route passes
+ * none (FP-187), so in practice this is the server's own clock.
+ */
 export function expiryReferenceTime(submittedAt?: string): Date {
   if (!submittedAt) return new Date();
   const parsed = new Date(submittedAt);

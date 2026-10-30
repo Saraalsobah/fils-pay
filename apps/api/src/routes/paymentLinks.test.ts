@@ -104,12 +104,17 @@ async function getPublicLink(token: string) {
   return app.inject({ method: "GET", url: `/v1/payment-links/${token}` });
 }
 
-async function pay(token: string, card: typeof APPROVED_CARD, idempotencyKey: string = randomUUID()) {
+async function pay(
+  token: string,
+  card: typeof APPROVED_CARD,
+  idempotencyKey: string = randomUUID(),
+  extraPayload: Record<string, unknown> = {},
+) {
   return app.inject({
     method: "POST",
     url: `/v1/payment-links/${token}/pay`,
     headers: { "idempotency-key": idempotencyKey },
-    payload: { card },
+    payload: { card, ...extraPayload },
   });
 }
 
@@ -184,7 +189,7 @@ test("declined authorize releases the reservation (not burned); retry with an ap
   assert.equal(readAfterRetry.json().status, "paid");
 });
 
-/** Amount comes from the link row; the body has only card (+ optional submittedAt). */
+/** Amount comes from the link row; the body has only card. */
 test("pay charges exactly the link's own amount — the request body carries no amount field", async () => {
   const { rawKey, merchantId } = await createApprovedMerchantWithApiKey("own-amount");
   const link = await createLink(rawKey, merchantId, { amountFils: 9_999 });
@@ -201,7 +206,6 @@ test("pay charges exactly the link's own amount — the request body carries no 
   assert.equal(Number(txnRow.rows[0]!.captured_fils), 9_999);
 });
 
-// only without submittedAt. with a past submittedAt it pays — that's the terminal case (FH)
 test("expired link is rejected: read reports 'expired', pay is rejected 410", async () => {
   const { rawKey, merchantId } = await createApprovedMerchantWithApiKey("expired");
   const link = await createLink(rawKey, merchantId, {
@@ -217,6 +221,29 @@ test("expired link is rejected: read reports 'expired', pay is rejected 410", as
   const payRes = await pay(link.token, APPROVED_CARD);
   assert.equal(payRes.statusCode, 410, payRes.body);
   assert.equal(payRes.json().error, "payment_link_expired");
+});
+
+// FP-187: the pay route is public, so a client-supplied `submittedAt` must never
+// decide whether a link has expired. The server's own clock is the only judge.
+test("FP-187: an expired link cannot be paid by sending an old submittedAt", async () => {
+  const { rawKey, merchantId } = await createApprovedMerchantWithApiKey("expired-submitted-at");
+  const link = await createLink(rawKey, merchantId, {
+    expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+  });
+  await pool.query(`UPDATE payment_links SET expires_at = now() - interval '1 minute' WHERE token = $1`, [link.token]);
+
+  const anHourAgo = new Date(Date.now() - 3_600_000).toISOString();
+  const payRes = await pay(link.token, APPROVED_CARD, randomUUID(), { submittedAt: anHourAgo });
+  assert.equal(payRes.statusCode, 410, payRes.body);
+  assert.equal(payRes.json().error, "payment_link_expired");
+
+  // Nothing was charged and the link is still unpaid.
+  const linkRow = await pool.query<{ status: string; transaction_id: string | null }>(
+    `SELECT status, transaction_id FROM payment_links WHERE token = $1`,
+    [link.token],
+  );
+  assert.notEqual(linkRow.rows[0]!.status, "paid");
+  assert.equal(linkRow.rows[0]!.transaction_id, null);
 });
 
 test("canceled link is rejected via both read and pay", async () => {
