@@ -373,3 +373,13 @@ Lead (not changed): there is still no explicit, audited "go live" action for a s
 
 Test: `TestRebuildBalances_UsesTheLedgerNotSchemeExportLines` (merchant owed 12,000 with 5,000 already paid out: ledger says 7,000; the button used to write 12,000).
 Not changed: `RefreshBalanceCache` and its two tests are left as they were (nothing calls it any more). ADMIN.md also says "the nightly recompute does the same at 02:00"; nothing in the code does that (lead: do not rely on it).
+
+## Money counters too narrow (bugs 37-38)
+
+| # | Bug | Where | Fix |
+|---|-----|-------|-----|
+| 37 | `platform_stats.total_processed_fils` was a 32-bit `INTEGER` (and `int32` in Go) while the volume-tier threshold is 2,000,000,000 fils. INTEGER tops out at 2,147,483,647 fils (2.1M BD); the comment "INTEGER in PostgreSQL is 64-bit" (from an AI answer) is false. Past that point the Go addition wrapped negative (reproduced: 2,147,000,000 + 1,000,000,000 stored as **-1,147,967,296**), which silently switched off the platform-wide 15 bps MDR bonus for every merchant, and the counter was garbage from then on | migration 0077, `settlement/platform_volume.go` | `BIGINT` column, `int64` in Go end to end |
+| 38 | `merchants.lifetime_net_payout_monitoring_estimate` was a `REAL` (float32) fed `float32(netPayout)`: not exact above 16,777,216 fils (16,777 BD), so adding small payouts to a big total was rounded away (reproduced: 100,000,000 + 1 + 3 + 4,700 stored as 1.00004704e+08, not exact). The sub-merchant **split payout path never updated it at all**, so split merchants' figure stopped growing. The comment "nobody reads it" does not make a money total approximate | migration 0077, `settlement/payout_estimate.go`, `splits/allocate.go` | `BIGINT` and integer fils; the migration recomputes every merchant's value from their paid batches; the split path now updates it too (inlined, because `settlement` imports `splits`); `EstimateMonthlyPayout` also integer |
+
+Tests: `TestRecordPlatformProcessedVolume_CrossesInt32Max`, `TestUpdateLifetimePayoutMonitoringEstimate_LargeValuesStayExact`. The first one resets the shared counter in cleanup; leaving it above the threshold made every later settlement test get the 15 bps bonus.
+Effect on existing data: the migration rewrites the lifetime estimate for every merchant from `settlement_batches` (it was only an approximation before); `platform_stats` keeps its value.

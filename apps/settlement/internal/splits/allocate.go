@@ -159,6 +159,17 @@ func PayoutSplitBatch(ctx context.Context, db *pgxpool.Pool, batchID uuid.UUID) 
 		return SplitPayoutResult{}, err
 	}
 
+	// Same running total PayoutBatch keeps for a non-split merchant; the split path
+	// used to skip it, so split merchants' lifetime figure silently stopped growing.
+	// (Inlined: internal/settlement imports this package, so it cannot be called from here.)
+	if _, err := tx.Exec(ctx, `
+		UPDATE merchants
+		   SET lifetime_net_payout_monitoring_estimate = lifetime_net_payout_monitoring_estimate + $2
+		 WHERE id = $1
+	`, parentMerchantID, int64(netPayout)); err != nil {
+		return SplitPayoutResult{}, err
+	}
+
 	_, err = tx.Exec(ctx, `UPDATE settlement_batches SET status = 'paid', paid_at = now() WHERE id = $1`, batchID)
 	if err != nil {
 		return SplitPayoutResult{}, err
