@@ -47,12 +47,14 @@ fi
 DOMAIN="$(grep '^DOMAIN=' ops/.env.prod | cut -d= -f2)"
 
 echo "==> 4/6 build and start (first build takes a few minutes)"
-"${COMPOSE[@]}" up -d --build
+"${COMPOSE[@]}" up -d --build </dev/null
 
 echo "==> 5/6 seed demo data (only if the database is empty)"
 COUNT="$("${COMPOSE[@]}" exec -T postgres psql -U filspay -d filspay -tAc "select count(*) from merchants" 2>/dev/null || echo 0)"
 if [ "${COUNT:-0}" = "0" ]; then
-  "${COMPOSE[@]}" --profile seed run --rm seed
+  # </dev/null: when this script is piped from curl, docker would otherwise read the rest of
+  # the script from stdin and the script would silently stop here.
+  "${COMPOSE[@]}" --profile seed run --rm seed </dev/null
 else
   echo "database already has $COUNT merchants; not reseeding (seeding truncates tables)"
 fi
@@ -64,7 +66,7 @@ for i in $(seq 1 30); do
   fi
   sleep 5
 done
-"${COMPOSE[@]}" ps
+"${COMPOSE[@]}" ps </dev/null
 echo
 echo "Merchant dashboard: https://${DOMAIN}/dashboard/login"
 echo "Admin console:      https://admin.${DOMAIN}"
