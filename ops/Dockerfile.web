@@ -5,6 +5,8 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 COPY apps ./apps
 COPY packages ./packages
+# apps/*/tsconfig.json extend ../../tsconfig.base.json; vite fails without it.
+COPY tsconfig.base.json tsconfig.json ./
 RUN npm ci
 ARG DOMAIN
 # Empty API base = same-origin calls to /v1 (Caddy proxies them), so session cookies just work.
