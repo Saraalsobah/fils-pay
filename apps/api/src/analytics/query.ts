@@ -293,7 +293,10 @@ interface LedgerActivityRow {
  *
  * `from`/`to` are Bahrain business-date strings (YYYY-MM-DD), matched against
  * `occurred_at` in Bahrain local calendar terms — Bahrain observes no DST
- * (fixed UTC+3 since 1972), so this reduces to a `date` comparison per row.
+ * (fixed UTC+3 since 1972), so the day range is [from 00:00, to+1 00:00) Bahrain time.
+ * The range is written against the bare `occurred_at` column so Postgres can use
+ * idx_ledger_entries_merchant_occurred; wrapping the column in AT TIME ZONE / ::date made the
+ * filter unusable by the index and every request read all of the merchant's ledger rows.
  */
 export async function getRecentLedgerActivity(
   pool: Pool,
@@ -303,7 +306,8 @@ export async function getRecentLedgerActivity(
     `SELECT id, account_id, direction, amount_fils, occurred_at, description
        FROM ledger_entries
       WHERE merchant_id = $1
-        AND (occurred_at AT TIME ZONE 'Asia/Bahrain')::date BETWEEN $2::date AND $3::date
+        AND occurred_at >= ($2::date)::timestamp AT TIME ZONE 'Asia/Bahrain'
+        AND occurred_at <  (($3::date + 1)::timestamp AT TIME ZONE 'Asia/Bahrain')
       ORDER BY occurred_at DESC
       LIMIT 200`,
     [input.merchantId, input.from, input.to],
