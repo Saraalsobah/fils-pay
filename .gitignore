@@ -3,6 +3,9 @@ dist/
 *.tsbuildinfo
 .env
 .env.local
+.env.*
+!.env.example
+!.env.*.example
 npm-debug.log*
 .DS_Store
 .claude/

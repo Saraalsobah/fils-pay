@@ -299,3 +299,9 @@ Tests: `apps/api/src/routes/authOtp.test.ts` (7 tests, 6 failed before the fixes
 | 25 | Cancelling a payment link used only the link id: merchant A could cancel merchant B's link (the route checked the URL merchant, not the link's owner) | `paymentLinks/cancel.ts` | UPDATE and lookup also filter `merchant_id` from auth; other merchant's id now gives 404 |
 
 Tests: `apps/api/src/routes/authz.test.ts` (3 tests, all failed before the fixes).
+
+## Committed secret (bug 26)
+
+| # | Bug | Where | Fix |
+|---|-----|-----|-----|
+| 26 | `ops/.env.docker` (holds `ACQUIRER_CALLBACK_SIGNING_SECRET`) was committed to git. Its header says "gitignored like .env" and a note says `.env` matches `.env.docker` as a prefix. Both are wrong: a gitignore pattern matches whole names, so only `.env` itself was ignored. Anyone with repo read access (judges, collaborators) can read the secret from history | `.gitignore`, `ops/.env.docker` | `.gitignore` now has `.env.*` (keeping `.env.*.example`); the file is untracked (`git rm --cached`, local copy kept); `ops/.env.docker.example` documents the variables with placeholders. **The old value is still in git history, so it must be treated as leaked: production uses freshly generated secrets, never this value.** |
