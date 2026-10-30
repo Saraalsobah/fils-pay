@@ -316,3 +316,15 @@ Tests: `apps/api/src/routes/authz.test.ts` (3 tests, all failed before the fixes
 
 Checked and fine: outbound `webhooks/sign.ts` (HMAC over `timestamp.canonicalJson`, constant-time compare). The comment worrying about a timing oracle on the timestamp is not a real problem because the timestamp is inside the MAC.
 Not changed (lead): inbound callbacks have no freshness window; with the unique index a replay is now harmless (it only appends an informational note).
+
+## Duplicate payout notifications (bugs 30-31, incident 2026-08-21)
+
+The postmortem blamed a reporting-worker restart replaying NOTIFYs ("retry artefact"). AM's question in ADMIN.md was right: the two deliveries had different outbox event ids, so it was not the same rows replayed. Two real causes:
+
+| # | Bug | Where | Fix |
+|---|-----|-------|-----|
+| 30 | `EnqueuePayoutNotifications` relies on `NOT EXISTS`, which two overlapping scans (daemon tick + `run-batch`, or two daemons) both pass, so two `settlement.paid` outbox events (different ids) are created for one batch. A comment claimed a unique index on `(event_type, aggregate_id)` prevented it; that index never existed. | `settlement/payout_notify.go`, migration 0075 | partial unique index on `outbox_events(aggregate_id) WHERE event_type='settlement.paid'` + `ON CONFLICT DO NOTHING`; the count only counts rows really inserted |
+| 31 | The payout disbursement record (the payout-rail instruction) is written as a side effect of each webhook **delivery** (attempt 0), so a merchant with 2 endpoints, or a replay, writes 2 disbursements for one batch. That is the "two disbursement records each" in the incident | `webhooks/payoutDisbursement.ts`, migration 0075 | unique index on `settlement_payout_disbursements(settlement_batch_id)` + `ON CONFLICT DO NOTHING` |
+
+Tests: Go `TestEnqueuePayoutNotificationsConcurrentScansEnqueueOnce` (12 concurrent scans -> 1 event) and TS `recordPayoutDisbursementEffect is idempotent per batch`.
+Lead (not changed): the disbursement is only recorded when a webhook delivery runs, so a merchant with no webhook endpoint never gets a disbursement record. It should be written when the batch is paid, not when a webhook is sent.

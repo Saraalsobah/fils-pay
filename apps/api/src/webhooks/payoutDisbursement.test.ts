@@ -56,3 +56,19 @@ test("recordPayoutDisbursementEffect inserts one row with the given batch id and
   );
   assert.notEqual(result.rows[0]!.disbursement_reference, batchId);
 });
+
+test("recordPayoutDisbursementEffect is idempotent per batch (two endpoints / retries must not pay twice)", async () => {
+  const batchId = await createPaidBatch(250_000);
+
+  await Promise.all([
+    recordPayoutDisbursementEffect(pool, batchId, 250_000),
+    recordPayoutDisbursementEffect(pool, batchId, 250_000),
+    recordPayoutDisbursementEffect(pool, batchId, 250_000),
+  ]);
+
+  const result = await pool.query<{ n: string }>(
+    `SELECT count(*)::text AS n FROM settlement_payout_disbursements WHERE settlement_batch_id = $1`,
+    [batchId],
+  );
+  assert.equal(result.rows[0]!.n, "1");
+});

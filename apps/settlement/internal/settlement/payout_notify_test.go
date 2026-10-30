@@ -2,6 +2,7 @@ package settlement
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -120,5 +121,30 @@ func TestEnqueuePayoutNotificationsSkipsIneligibleBatches(t *testing.T) {
 	}
 	if got := countPaidEvents(t, pool, notPaid); got != 0 {
 		t.Fatalf("a batch that has not reached 'paid' must not be notified, got %d event(s)", got)
+	}
+}
+
+// Two scans at the same moment (the daemon tick and `run-batch`) must still
+// produce exactly one settlement.paid event per batch. The NOT EXISTS guard
+// alone does not do that: both transactions see "no event yet" and both insert.
+func TestEnqueuePayoutNotificationsConcurrentScansEnqueueOnce(t *testing.T) {
+	pool := mustPool(t)
+	ctx := context.Background()
+
+	merchantID := insertActiveMerchant(t, pool, 250)
+	paidBatch := insertBatch(t, pool, merchantID, time.Date(2026, 3, 9, 0, 0, 0, 0, time.UTC), "paid", 120_000)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 12; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = EnqueuePayoutNotifications(ctx, pool)
+		}()
+	}
+	wg.Wait()
+
+	if got := countPaidEvents(t, pool, paidBatch); got != 1 {
+		t.Fatalf("expected exactly 1 settlement.paid event after 12 concurrent scans, got %d", got)
 	}
 }
