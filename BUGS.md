@@ -10,8 +10,9 @@ and how the fix was checked. "Fixed" means a code change plus tests.
 | 2 | Migration 0054 cannot apply on a fresh database | `db/migrations/0054_views.sql` | Fixed |
 | 3 | Migration 0055 cannot apply on a fresh database | `db/migrations/0055_chart_of_accounts_suspense.sql` | Fixed |
 | 4 | The built-in dev webhook key is invalid, so the API and the seed refuse to start | `apps/api/src/config.ts` | Worked around |
+| 5 | A payment link can be paid after it has expired (FP-187) | `apps/api/src/routes/paymentLinks.ts` | Fixed |
 
-Fixes for bugs 1-3 are in commit `12fdf81` (it also contains our local setup files).
+Fixes for bugs 1-3 are in commit `12fdf81` (it also contains our local setup files). Bug 5 is in its own commit.
 
 ---
 
@@ -102,6 +103,34 @@ fallback constant itself is still wrong.
 
 ---
 
+## Bug 5: A payment link can be paid after it has expired (FP-187)
+
+**Files:** `apps/api/src/routes/paymentLinks.ts`, `apps/web/src/pages/checkout/CheckoutPage.tsx`
+
+**What is wrong:** the public pay endpoint takes a `submittedAt` time from the request body and
+uses it to decide whether the link has expired. The checkout page sends the browser's clock.
+Anyone can send an old time and pay an expired link.
+
+**Why it happens:** the route's own comment says `submittedAt` is "ignored unless the request is
+authenticated with an API key", but the route is public and has no such check. It passed
+`submittedAt` straight through to the expiry decision. `docs/ARCHITECTURE.md` described the
+client-clock rule as intended ("offline terminals").
+
+**What it breaks:** expired links keep taking money. A merchant who expires a link on purpose
+cannot rely on it, and a buyer who saw "expired" can still pay (the report in FP-187).
+
+**Fix:** the route no longer forwards `submittedAt`, so expiry is judged only against the server
+clock. The checkout page no longer sends it, and ARCHITECTURE.md now says so.
+Trade-off: a buyer who pressed pay just before expiry and retries after it is now expired.
+The documented "offline terminal" case is no longer supported on the public route.
+
+**Tests and evidence:** a new route test pays an expired link while sending a `submittedAt` one
+hour in the past. Before the fix it returned HTTP 200 (paid). After the fix it returns 410
+`payment_link_expired`, the link stays unpaid and no transaction is created. All 13 payment-link
+tests pass, and the api and web typechecks are clean.
+
+---
+
 ## Setup problems found (not app bugs)
 
 - `ops/Dockerfile.node` and `ops/Dockerfile.go` are referenced by the compose file and the ops
@@ -111,7 +140,6 @@ fallback constant itself is still wrong.
 
 ## Leads: read in the code, not yet reproduced or fixed
 
-- Payment-link expiry is judged against `submittedAt`, a time sent by the buyer's browser.
 - OTP codes come from `Math.random()` (`apps/api/src/lib/random.ts`).
 - Two-person credit approval compares `displayName` instead of the admin user id.
 - Refunds: the transaction row is read without a lock, and the refundable amount is computed
@@ -123,7 +151,12 @@ fallback constant itself is still wrong.
   amount.
 - The "Rebuild cached balances" button reads `merchant_payable_position`, a view over
   `scheme_export_lines`, instead of the ledger.
-- `payments/discountAdjustment.ts` parses money with `parseFloat(...) * 100`.
+- Discounts: `parsePromotionalDiscountFils` in `payments/discountAdjustment.ts` uses
+  `parseFloat(...) * 100`, but nothing calls it (dead code). Separately, the capture-time rebate
+  applies the discount to the fee, while the Go settlement applies it to the amount first. The
+  meeting notes say "Go is the reference for fees, capture.ts follows". The two differ by up to a
+  fil per capture (602 fils at 275 bps with a 12.5% discount: 15 fils in the API, 14 in Go), and
+  payment-link captures never get the API rebate at all.
 - Uploading the same adjustment CSV twice applies it twice (no idempotency, despite a comment
   assuming one).
 - `ops/.env.docker` contains an acquirer callback signing secret, and `.gitignore` does not
