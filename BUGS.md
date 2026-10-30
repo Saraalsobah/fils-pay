@@ -12,6 +12,16 @@ and how the fix was checked. "Fixed" means a code change plus tests.
 | 4 | The built-in dev webhook key is invalid, so the API and the seed refuse to start | `apps/api/src/config.ts` | Worked around |
 | 5 | A payment link can be paid after it has expired (FP-187) | `apps/api/src/routes/paymentLinks.ts` | Fixed |
 | 6 | Split payouts do not add up to the net payout | `apps/settlement/internal/splits/` | Fixed |
+| 7 | Every refund without a `reason` crashes (migration 0070 constraint) | `apps/api/src/payments/processRefund.ts` | Fixed |
+| 8 | A refund could exceed what was captured (ceiling used the authorized amount) | `processRefund.ts` | Fixed |
+| 9 | Concurrent refunds can together exceed the sale (FP-209, no row lock) | `processRefund.ts` | Fixed |
+| 10 | A fully refunded partly-captured sale stays `partially_captured` | `apps/api/src/payments/refundState.ts` | Fixed |
+| 11 | Fee reversed across partial refunds does not add up to the fee charged | `processRefund.ts` | Fixed |
+| 12 | Any merchant could refund another merchant's transaction | `apps/api/src/refunds/initiateMerchantRefund.ts` | Fixed |
+| 13 | Net payout computed through `float32` (a 123,456.789 BD batch paid 3 fils short) | `apps/settlement/internal/settlement/payable.go` | Fixed |
+| 14 | `refund_merchant_summary` is always empty (wrong join key) | `db/migrations/0072_refund_merchant_summary.sql` | Fixed |
+| 15 | The dashboard would crash on the timeline of any refunded transaction | `apps/web/src/format.ts` | Fixed |
+| 16 | **FP-300: refunds** (`POST /v1/refunds` returned 501; settlement ignored refunds) | see the FP-300 section | Built |
 
 Fixes for bugs 1-3 are in commit `12fdf81` (it also contains our local setup files). Bug 5 is in its own commit.
 
@@ -144,6 +154,86 @@ tests pass, and the api and web typechecks are clean.
 
 **Evidence.** New tests `TestChildShares_UnevenAmountsStillSumToNet`, `TestChildShares_Deterministic` and `TestValidateWeights`. Before the fix 6 of 8 uneven cases failed; afterwards all pass.
 
+## Bugs 7 to 12: the refund processor (`apps/api/src/payments/processRefund.ts`)
+
+The previous developer called this helper "complete, tested". Their own tests did not even pass
+on a fresh database (7 of 10 failed), and writing tests for each of these first showed the rest.
+
+**7. Refunds without a reason crash.** *Why:* migration 0070 added `CHECK (reason IS NOT NULL)`,
+but the code inserted `NULL` when no reason was given. *Breaks:* every refund that does not state a
+reason ends in a database error. *Fix:* store `'unspecified'` (`COALESCE($6, 'unspecified')`).
+
+**8. Over-refund.** *Why:* the refundable amount was `authorized - refunded`; it must be
+`captured - refunded`. *Breaks:* on a 10,000 fils sale of which 4,000 was captured, a 6,000 refund
+was accepted: the merchant gives back money the cardholder was never charged. *Fix:* use the captured
+amount. *Test:* `a partially captured transaction cannot refund more than it captured`.
+
+**9. Concurrent refunds (FP-209).** *Why:* the transaction row was read without a lock, in a
+transaction separate from the one that wrote the refund, so parallel requests all saw the same
+`refunded_fils`. *Breaks:* we sent 6 refunds of 3,000 at once against a 10,000 sale and all 6 were
+accepted (18,000 fils refunded). *Fix:* one transaction with `SELECT ... FOR UPDATE` taken before the
+check and held through the acquirer call, exactly how `captureTransaction` already works. *Test:*
+`concurrent refunds cannot together exceed the captured amount (FP-209)` now accepts exactly 3.
+
+**10. Wrong status after a full refund.** *Why:* `nextStatusAfterRefund` returned
+`partially_captured` whenever the sale was only partly captured, even after everything captured had
+been refunded (a code comment even doubted it). *Breaks:* finance's rule is "refunded when every fils we
+captured went back"; the dashboard showed the wrong status. *Fix:* derive the status from the refunded
+total against the captured amount, and release any active authorization hold once refunded.
+
+**11. Fee reversal drift.** *Why:* the fee given back was rounded separately for each partial refund
+(`round(fee x refund / captured)`), and rounding errors do not cancel. *Breaks:* three refunds of 333 on a
+999 fils sale gave back 8 + 8 + 8 = 24 fils of a 25 fils fee; the merchant stays 1 fil short, and
+the reconciliation drifts. *Fix:* reverse the fee cumulatively: the fee due for everything refunded so
+far, minus what was already given back, so the last refund lands exactly on the fee charged.
+
+**12. Cross-merchant refund.** *Why:* `initiateMerchantRefund` looked the transaction up by id only and
+refunded it for whichever merchant owned it; a test for it had been deleted as "redundant".
+*Breaks:* any merchant (or API key) could refund any other merchant's transaction if it knew its id.
+*Fix:* the lookup, and the row lock, are scoped to the caller's own merchant (404 otherwise).
+
+## Bug 13: Net payout through `float32` (`settlement/payable.go`)
+
+*Why:* `NetPayableFils` turned fils into `float32` BD and back. A `float32` holds integers exactly only up to
+16,777,216, so a batch of 16,777 BD or more can be off by fils. *Breaks:* a batch of 123,456.789 BD with a
+3,086.419 BD fee paid out 120,370.367 instead of 120,370.370. *Fix:* integer subtraction.
+*Test:* `TestNetPayableFils_IsExactIntegerSubtraction`.
+
+## Bug 14: `refund_merchant_summary` is always empty
+
+*Why:* the view joined `transactions t ON t.id = r.id`: a refund's own id against a transaction id, which never
+matches. *Fix:* join on `r.transaction_id`. After the fix the view counted all 123 refunds from our
+test run. (Nothing refreshes or reads this view yet.)
+
+## Bug 15: Negative amounts crash the dashboard
+
+*Why:* `bhd()` called `toFils()` without `allowNegative`, and refund events on the transaction timeline carry
+negative amounts. *Breaks:* the detail page of every refunded transaction would have thrown. *Fix:* allow
+negatives in the display helper.
+
+## FP-300: refunds, built end to end
+
+What the ticket asked for, and where it is:
+
+| Requirement | How |
+|---|---|
+| Money goes back to the cardholder | `acquirer.refund(...)` is called inside the locked transaction; a decline answers 402 and writes nothing, an error answers 502 and leaves the key retryable |
+| Reverse the right share of the MDR | cumulative fee reversal (Bug 11), booked as ledger legs `platform_fee_revenue` debit / `merchant_payable` credit |
+| Adjust the merchant's next settlement batch | `CloseBatch` claims unbatched refunds and subtracts them from the payout (migration 0073: `refunds_fils`, `refund_fee_reversed_fils`). It takes the oldest first and stops at the first one the day's money cannot cover, so a payout is never negative and a refund is never lost; the rest wait for the next batch. `RecalculateMDR` keeps the deduction |
+| `refund.succeeded` to the merchant webhook | added to the dispatcher list **and** `buildEnvelope` (adding it to the list alone would have thrown and stalled the whole webhook queue) |
+| Timeline, settlement report, reconciliation | timeline events `refund_partial` / `refunded`; batch report shows the refund lines; the reconciliation subtracts refunds not yet batched, so a period with refunds still explains to zero |
+
+The route is `POST /v1/refunds` with an `Idempotency-Key` header (the old draft used `crypto.randomUUID()`,
+a new key per request, which defeats idempotency). Body: `transactionId`, optional `amountFils` (whole
+fils, left out = everything still refundable) and `reason`. Allowed: an API key, or a signed-in `owner` or
+`finance` user. An admin's "view as merchant" session is refused. The dashboard refund drawer was
+restored and points at the same route; it reuses one key for a retry of the same refund and makes a new
+one after a definite answer.
+
+Checks: API tests 381 of 382 pass (the one failure, a webhook-retry timing test, fails the same way
+without our changes); Go tests all pass, including 6 new ones for refund netting, and a test that after
+capture, refund, close and payout the cached balance and the balance rebuilt from the ledger agree (both 0).
+
 ## Setup problems found (not app bugs)
 
 - `ops/Dockerfile.node` and `ops/Dockerfile.go` are referenced by the compose file and the ops
@@ -157,11 +247,6 @@ tests pass, and the api and web typechecks are clean.
 
 - OTP codes come from `Math.random()` (`apps/api/src/lib/random.ts`).
 - Two-person credit approval compares `displayName` instead of the admin user id.
-- Refunds: the transaction row is read without a lock, and the refundable amount is computed
-  from the authorized amount instead of the captured amount.
-- Split payouts: each child share is rounded separately, so fils can be lost, and the balance
-  cache is reduced by the allocated total instead of the batch net payout.
-- `NetPayableFils` uses `float32`.
 - The scheme export `amount` column is computed from the untruncated gross, not the truncated
   amount.
 - The "Rebuild cached balances" button reads `merchant_payable_position`, a view over
@@ -176,3 +261,18 @@ tests pass, and the api and web typechecks are clean.
   assuming one).
 - `ops/.env.docker` contains an acquirer callback signing secret, and `.gitignore` does not
   ignore that file.
+- Capture and void are only hidden from `support` in the UI; the API lets any authenticated merchant
+  actor call them, including an admin's "view as merchant" session (`requireMerchantAuth` does not
+  block impersonation on writes, and `requireMerchantWriterActor` then records it as a normal merchant
+  session). Refunds are gated to `owner`/`finance`; capture and void are not.
+- `refund.succeeded` is deliberately NOT added to the reporting consumer: `applyDailySummaryRollup` writes
+  `refund_count` / `refund_gross_fils` to `merchant_daily_volume`, columns no migration creates, so
+  adding the event type (as a code comment suggests) would crash the consumer on the first refund.
+- A merchant whose refunds exceed everything they ever capture is never paid negative; the refunds wait
+  unclaimed. The platform has to recover that money some other way.
+- If a refund is carried into a later batch (because its own day could not cover it), the reconciliation
+  for the refund's own period shows that amount as a gap.
+- Webhook retry: `backoffDelayMs` adds +/-10% random jitter but the dispatcher test expects an exact 1000 ms,
+  so that test fails (it also fails without our changes).
+- `merchants.refunds_enabled`: the comment in migration 0052 says NULL means "disabled", the code and
+  its other comment treat NULL as "no hold". We left the code as is.
