@@ -383,3 +383,9 @@ Not changed: `RefreshBalanceCache` and its two tests are left as they were (noth
 
 Tests: `TestRecordPlatformProcessedVolume_CrossesInt32Max`, `TestUpdateLifetimePayoutMonitoringEstimate_LargeValuesStayExact`. The first one resets the shared counter in cleanup; leaving it above the threshold made every later settlement test get the 15 bps bonus.
 Effect on existing data: the migration rewrites the lifetime estimate for every merchant from `settlement_batches` (it was only an approximation before); `platform_stats` keeps its value.
+
+## Bug 39 — Scheme export amount disagrees with amount_fils (settlement/batch.go)
+**What's wrong:** each scheme_export_lines row stored `amount_fils` from the TRUNCATED gross (4747 → 4740) but `amount` (BD) from the UNtruncated gross via float64, then Postgres NUMERIC(10,2) ROUNDS (4.747 → 4.75). The file said 4.75, the batch said 4.74.
+**Why it matters:** the scheme file is what the acquirer reconciles against; every line with a non-zero last digit ≥5 is 0.01 BD off, and totals never tie to the batch. Float math on money is also a rule break.
+**Fix:** `amount` is now `$3::numeric / 1000` in the same INSERT, from the same truncated integer (exact, no float). Migration 0078 repairs existing rows. Test: TestSchemeExportAmountAgreesWithAmountFils (failed before, passes now).
+**Lead:** truncation itself drops up to 9 fils per line; finance's note said half-up was wanted ("revisit") — a business decision, left as is.

@@ -322,12 +322,15 @@ func CloseBatch(ctx context.Context, db *pgxpool.Pool, merchantID uuid.UUID, bus
 		}
 	}
 
+	// amount is derived in SQL from the SAME truncated fils as amount_fils ($3), as exact
+	// numeric division. It used to come from the untruncated gross via float64, and NUMERIC(10,2)
+	// rounds, so 4,747 fils was exported as 4.75 while amount_fils said 4,740.
 	for i, line := range lines {
 		truncated := TruncateToSchemeAmount(line.grossFils)
 		_, err = tx.Exec(ctx, `
 			INSERT INTO scheme_export_lines (settlement_batch_id, transaction_id, amount_fils, amount, line_sequence)
-			VALUES ($1, $2, $3, $4, $5)
-		`, batchID, line.transactionID, int64(truncated), SchemeAmountBD(line.grossFils), i+1)
+			VALUES ($1, $2, $3::bigint, $3::numeric / 1000, $4)
+		`, batchID, line.transactionID, int64(truncated), i+1)
 		if err != nil {
 			return BatchResult{}, fmt.Errorf("settlement: CloseBatch: insert scheme export line: %w", err)
 		}

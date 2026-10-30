@@ -26,6 +26,7 @@ func TruncateToSchemeAmount(grossFils money.Fils) money.Fils {
 
 // SchemeAmountBD converts a transaction's gross fils to the BD value stored
 // in scheme_export_lines.amount (numeric(10,2)).
+// Deprecated: float-based and not truncated; do not use for stored amounts (see CloseBatch).
 func SchemeAmountBD(grossFils money.Fils) float64 {
 	return float64(grossFils) / 1000.0
 }
