@@ -1,6 +1,11 @@
 import type { PoolClient } from "pg";
 
-/** Clears the sandbox flag when a merchant has no open authorizations. */
+/**
+ * UNUSED, kept only so history reads clearly. This helper cleared a merchant's
+ * `test_mode` flag as a side effect of the admin "recompute transaction statuses"
+ * button, which silently moved sandbox merchants into live settlement. Nothing calls
+ * it any more; going live must be an explicit, audited action, never a side effect.
+ */
 export async function reconcileSandboxFlag(
   client: PoolClient,
   merchantId: string,

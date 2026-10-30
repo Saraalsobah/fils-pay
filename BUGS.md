@@ -355,3 +355,12 @@ Deliberately NOT changed: `BusinessDayWindow` itself keeps its calendar-date con
 
 Test: `TestRecalculateMDR_PaidBatchIsLeftAlone` (before: a paid batch's fee went 1,250 -> 2,000 fils).
 Lead (not changed): a rate correction on already-paid days is then never recovered; finance needs an explicit adjustment posted into the current open batch.
+
+## "Recompute statuses" switched sandbox merchants into live settlement (bug 35)
+
+| # | Bug | Where | Fix |
+|---|-----|-------|-----|
+| 35 | The admin button "Recompute transaction statuses" (documented as "safe to run more than once") also ran `reconcileSandboxFlag`, which set `merchants.test_mode = false` whenever the merchant "had no open authorizations". That check is always true: the recompute query already excludes `authorized` transactions, so `openAuthorizations` is always 0. Result: pressing the button once on a sandbox merchant (e.g. Gamma Hospitality, "must stay out of real settlement until they go live") put them into the next real settlement run, with no audit of the go-live and no approval. `CloseBatch` and the daily run skip `test_mode` merchants, which is the only thing keeping sandbox activity out of real payouts | `routes/adminMerchantsRecompute.ts`, `admin/merchantFlags.ts` | the recompute no longer touches `test_mode`; the helper is kept but marked unused (`flagsUpdated` stays in the response as `[]` for the admin UI) |
+
+Test: `routes/adminRecomputeSandbox.test.ts` (before: `test_mode` flipped true -> false).
+Lead (not changed): there is still no explicit, audited "go live" action for a sandbox merchant; one should replace the old side effect.
