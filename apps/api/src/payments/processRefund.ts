@@ -17,7 +17,7 @@ export interface ProcessRefundInput {
   merchantId: string;
   amountFils?: Fils;
   idempotencyKey: string;
-  actor: { type: "merchant_session" | "merchant_api_key"; id: string };
+  actor: { type: "merchant_session" | "merchant_api_key" | "system"; id: string };
   reason?: string;
 }
 

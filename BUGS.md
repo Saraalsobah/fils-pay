@@ -328,3 +328,12 @@ The postmortem blamed a reporting-worker restart replaying NOTIFYs ("retry artef
 
 Tests: Go `TestEnqueuePayoutNotificationsConcurrentScansEnqueueOnce` (12 concurrent scans -> 1 event) and TS `recordPayoutDisbursementEffect is idempotent per batch`.
 Lead (not changed): the disbursement is only recorded when a webhook delivery runs, so a merchant with no webhook endpoint never gets a disbursement record. It should be written when the batch is paid, not when a webhook is sent.
+
+## Payment link charged twice (bug 32, incident 2026-05-14)
+
+| # | Bug | Where | Fix |
+|---|-----|-------|-----|
+| 32 | The postmortem blamed duplicate acquirer callbacks and said the claim in `pay.ts` was "ruled out" (confirmed by an AI review). It is not safe: a `reserved` link older than the timeout (60 s) can be re-claimed, while the first payer's authorize+capture is still running with no lock. The second payer re-claims, pays and finalizes first; the first payer's finalize then matches 0 rows, the code logs "unreachable" and **still answers 200 "paid"** (a comment from FH said exactly this and was dismissed). Both cards are charged. The "unique constraint, one successful capture per link" (FP-202) also does not exist. Reproduced with a test whose first capture takes 2.5 s with a 1 s timeout: both payers got 200 and 10,000 fils net was captured for a 5,000 fils link | `paymentLinks/pay.ts`, migration 0076 | each claim gets its own `reservation_id`; finalize and release only work for the current holder (a stale request can no longer free someone else's reservation); a payer who loses the link after capturing is **refunded automatically** (system refund, `refunds.created_by_type` now allows `system`) and gets 409 `payment_link_already_paid` |
+
+Test: `paymentLinks/payRace.test.ts` (failed before: `[200,200]`; now one 200, one 409, net captured = one link amount).
+Note: the postmortem root cause (duplicate callbacks) was real but is a separate bug (27/28); callbacks only append informational notes and never touched link status.

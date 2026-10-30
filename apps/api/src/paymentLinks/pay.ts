@@ -2,6 +2,7 @@ import type { Pool } from "pg";
 import { toFils } from "@filspay/money";
 import { authorizeTransaction } from "../payments/authorize.js";
 import { captureTransaction } from "../payments/capture.js";
+import { processRefund } from "../payments/processRefund.js";
 import type { AcquirerSimulator, SimulatedCardInput } from "../acquirer/types.js";
 
 export interface PayPaymentLinkInput {
@@ -19,6 +20,7 @@ export interface PayPaymentLinkResult {
 /** Returned by the claim UPDATE; merchant_id comes from the link row, never from the request. */
 interface ClaimedLinkRow {
   id: string;
+  reservation_id: string;
   merchant_id: string;
   amount_fils: string | number;
   reference: string | null;
@@ -67,14 +69,14 @@ export async function payPaymentLink(
   // YA: one conditional UPDATE = atomic claim, no explicit txn needed. correct
   const claimResult = await pool.query<ClaimedLinkRow>(
     `UPDATE payment_links
-        SET status = 'reserved', reserved_at = now()
+        SET status = 'reserved', reserved_at = now(), reservation_id = gen_random_uuid()
       WHERE token = $1
         AND (
              status = 'active'
              OR (status = 'reserved' AND reserved_at < now() - ($2 || ' seconds')::interval)
             )
         AND expires_at > $3
-      RETURNING id, merchant_id, amount_fils, reference`,
+      RETURNING id, reservation_id, merchant_id, amount_fils, reference`,
     [input.token, config.paymentLinkReservationTimeoutSeconds, expiryCheckTime],
   );
 
@@ -85,6 +87,7 @@ export async function payPaymentLink(
 
   const link = {
     id: claimedRow.id,
+    reservationId: claimedRow.reservation_id,
     merchantId: claimedRow.merchant_id,
     amountFils: toFils(Number(claimedRow.amount_fils)),
     reference: claimedRow.reference,
@@ -105,7 +108,7 @@ export async function payPaymentLink(
   });
 
   if (authResult.statusCode !== 201) {
-    await releaseReservation(pool, link.id);
+    await releaseReservation(pool, link.id, link.reservationId);
     return {
       statusCode: authResult.statusCode,
       body: { stage: "authorize", ...(authResult.body as Record<string, unknown>) },
@@ -129,7 +132,7 @@ export async function payPaymentLink(
   });
 
   if (captureResult.statusCode !== 200) {
-    await releaseReservation(pool, link.id);
+    await releaseReservation(pool, link.id, link.reservationId);
     return {
       statusCode: captureResult.statusCode,
       body: { stage: "capture", ...(captureResult.body as Record<string, unknown>) },
@@ -145,10 +148,10 @@ export async function payPaymentLink(
     paid_at: Date;
   }>(
     `UPDATE payment_links
-        SET status = 'paid', paid_at = now(), transaction_id = $2, reserved_at = NULL
-      WHERE id = $1 AND status = 'reserved'
+        SET status = 'paid', paid_at = now(), transaction_id = $2, reserved_at = NULL, reservation_id = NULL
+      WHERE id = $1 AND status = 'reserved' AND reservation_id = $3
       RETURNING id, paid_at`,
-    [link.id, txnId],
+    [link.id, txnId, link.reservationId],
   );
 
   const finalized = finalizeResult.rows[0];
@@ -156,19 +159,22 @@ export async function payPaymentLink(
   // pays and finalizes first; we land here, answer 200, and the card was charged twice
   // MK: authorize+capture is under a second. 60s can't happen. unreachable
   if (!finalized) {
-    // Should be unreachable in normal operation (this request is the only
-    // holder of the reservation). The acquirer-side capture genuinely
-    // succeeded and money moved; failing to *record* that fact against the
-    // link is a data-consistency bug to surface loudly, not a reason to
-    // tell a customer whose card was actually charged that their payment
-    // failed.
+    // We lost the link: our capture outlasted the reservation timeout and another
+    // payer re-claimed and finalized it. This card has really been charged, so give
+    // the money back (system refund) instead of telling the customer "paid".
     console.error(
-      `payPaymentLink: finalize UPDATE matched 0 rows for link ${link.id} after a successful capture ` +
-        `(transaction ${txnId}) — invariant violation, investigate`,
+      `payPaymentLink: lost the reservation on link ${link.id} after capturing transaction ${txnId}; refunding it`,
     );
+    const refund = await processRefund(pool, acquirer, {
+      transactionId: txnId,
+      merchantId: link.merchantId,
+      idempotencyKey: `paylink:${link.id}:${input.idempotencyKey}:auto-refund`,
+      actor: { type: "system", id: link.id },
+      reason: "payment link was already paid by another customer",
+    });
     return {
-      statusCode: 200,
-      body: { status: "paid", transactionId: txnId, amountFils: link.amountFils, paidAt: new Date().toISOString() },
+      statusCode: 409,
+      body: { error: "payment_link_already_paid", refunded: refund.statusCode === 201 || refund.statusCode === 200 },
     };
   }
 
@@ -188,10 +194,14 @@ export async function payPaymentLink(
  * 'reserved'` for the same reason as the finalize UPDATE: this request
  * only ever releases the reservation it itself holds.
  */
-async function releaseReservation(pool: Pool, linkId: string): Promise<void> {
-  await pool.query(`UPDATE payment_links SET status = 'active', reserved_at = NULL WHERE id = $1 AND status = 'reserved'`, [
-    linkId,
-  ]);
+async function releaseReservation(pool: Pool, linkId: string, reservationId: string): Promise<void> {
+  // Only release a reservation THIS request still holds. A stale request must not
+  // free the link out from under whoever re-claimed it after the timeout.
+  await pool.query(
+    `UPDATE payment_links SET status = 'active', reserved_at = NULL, reservation_id = NULL
+      WHERE id = $1 AND status = 'reserved' AND reservation_id = $2`,
+    [linkId, reservationId],
+  );
 }
 
 /**
