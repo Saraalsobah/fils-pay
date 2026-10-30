@@ -8,7 +8,7 @@
  *
  * Usage: DATABASE_URL=postgres://... npx tsx scripts/reconcile_march.ts
  */
-import { randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { Client } from "pg";
 import { formatBhd, toFils } from "@filspay/money";
@@ -29,7 +29,7 @@ export function computeResidueFils(capturedFils: number): number {
   return capturedFils % 10;
 }
 
-interface MerchantResidue {
+export interface MerchantResidue {
   merchantId: string;
   lineCount: number;
   residueFils: number;
@@ -68,10 +68,34 @@ function groupByMerchant(rows: ResidueRow[]): MerchantResidue[] {
   return [...byMerchant.values()];
 }
 
-// am: re-running is safe, entry_group_id dedupes it
-async function postResidueCorrection(client: Client, merchant: MerchantResidue, now: Date): Promise<void> {
-  if (merchant.residueFils <= 0) return;
-  const entryGroupId = randomUUID();
+/**
+ * The same merchant + month always maps to the same entry_group_id (a UUID built from a hash,
+ * not randomUUID()). The old code generated a fresh random id on every run, so the "entry_group_id
+ * dedupes re-runs" comment was false: running the sweep twice wrote the residue off twice.
+ */
+export function sweepEntryGroupId(year: number, month: number, merchantId: string): string {
+  const h = createHash("sha256").update(`reconcile-sweep:${year}-${month}:${merchantId}`).digest();
+  h[6] = (h[6]! & 0x0f) | 0x50; // version 5-style
+  h[8] = (h[8]! & 0x3f) | 0x80; // RFC 4122 variant
+  const x = h.subarray(0, 16).toString("hex");
+  return `${x.slice(0, 8)}-${x.slice(8, 12)}-${x.slice(12, 16)}-${x.slice(16, 20)}-${x.slice(20, 32)}`;
+}
+
+/** Returns true if it posted, false if this merchant+month was already swept. Must run inside a transaction. */
+export async function postResidueCorrection(
+  client: Client,
+  merchant: MerchantResidue,
+  now: Date,
+  year = 2026,
+  month = 3,
+): Promise<boolean> {
+  if (merchant.residueFils <= 0) return false;
+  const entryGroupId = sweepEntryGroupId(year, month, merchant.merchantId);
+  // Serialise concurrent runs for the same group, then check-and-insert. (There is no unique
+  // index on entry_group_id: a group legitimately has several legs.)
+  await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [entryGroupId]);
+  const existing = await client.query("SELECT 1 FROM ledger_entries WHERE entry_group_id = $1 LIMIT 1", [entryGroupId]);
+  if (existing.rowCount && existing.rowCount > 0) return false;
   const description = "March 2026 scheme rounding residue sweep — manual recon per finance";
   await client.query(
     `INSERT INTO ledger_entries (entry_group_id, merchant_id, account_id, direction, amount_fils, occurred_at, description)
@@ -79,6 +103,7 @@ async function postResidueCorrection(client: Client, merchant: MerchantResidue, 
             ($1, $2, 'scheme_rounding_residue', 'credit', $3, $4, $5)`,
     [entryGroupId, merchant.merchantId, merchant.residueFils, now.toISOString(), description],
   );
+  return true;
 }
 
 async function main(): Promise<void> {
@@ -106,7 +131,11 @@ async function main(): Promise<void> {
     await client.query("BEGIN");
     try {
       for (const merchant of merchantResidues) {
-        await postResidueCorrection(client, merchant, now);
+        const posted = await postResidueCorrection(client, merchant, now);
+        if (!posted) {
+          console.log(`merchant ${merchant.merchantId}: already swept, skipped`);
+          continue;
+        }
         console.log(
           `merchant ${merchant.merchantId}: ${merchant.lineCount} line(s), residue ${formatBhd(toFils(merchant.residueFils))} BD (${merchant.residueFils} fils)`,
         );
