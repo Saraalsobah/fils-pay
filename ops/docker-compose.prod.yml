@@ -85,6 +85,9 @@ services:
     build: { context: .., dockerfile: ops/Dockerfile.go }
     restart: unless-stopped
     command: ["./settlement", "daemon"]
+    # A redeploy sends SIGTERM; the daemon lets an in-flight batch transaction finish. Give it
+    # 60 s (Docker's default is 10 s) before a forced kill; a killed batch rolls back whole.
+    stop_grace_period: 60s
     environment:
       DATABASE_URL: postgres://filspay:${POSTGRES_PASSWORD}@postgres:5432/filspay?sslmode=disable
       SETTLEMENT_INTERNAL_TOKEN: ${SETTLEMENT_INTERNAL_TOKEN}
