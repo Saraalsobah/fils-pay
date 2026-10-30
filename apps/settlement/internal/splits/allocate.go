@@ -6,6 +6,7 @@ package splits
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -87,7 +88,8 @@ func PayoutSplitBatch(ctx context.Context, db *pgxpool.Pool, batchID uuid.UUID) 
 		return SplitPayoutResult{}, err
 	}
 
-	var shares []ChildShare
+	var children []ChildWeight
+	var childIDs []uuid.UUID
 	for rows.Next() {
 		var childID uuid.UUID
 		var weightBps int64
@@ -95,14 +97,28 @@ func PayoutSplitBatch(ctx context.Context, db *pgxpool.Pool, batchID uuid.UUID) 
 			rows.Close()
 			return SplitPayoutResult{}, err
 		}
-		share := money.ApplyRateFils(money.Fils(netPayout), weightBps)
-		shares = append(shares, ChildShare{ChildMerchantID: childID, WeightBps: weightBps, AllocatedFils: share})
+		childIDs = append(childIDs, childID)
+		children = append(children, ChildWeight{WeightBps: weightBps})
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
 		return SplitPayoutResult{}, err
 	}
 	rows.Close()
+
+	// Refuse to move any money if the weights are misconfigured (FP-250):
+	// nothing has been written yet, so the deferred rollback leaves the batch
+	// 'closed' for a human to fix rather than mis-paying it.
+	if err := ValidateWeights(children); err != nil {
+		return SplitPayoutResult{}, fmt.Errorf("splits: batch %s: %w", batchID, err)
+	}
+
+	// Largest-remainder allocation: the shares add up to netPayout exactly.
+	amounts := ChildShares(money.Fils(netPayout), children)
+	shares := make([]ChildShare, len(children))
+	for i := range children {
+		shares[i] = ChildShare{ChildMerchantID: childIDs[i], WeightBps: children[i].WeightBps, AllocatedFils: amounts[i]}
+	}
 
 	var totalAllocated money.Fils
 	for _, s := range shares {
@@ -134,8 +150,12 @@ func PayoutSplitBatch(ctx context.Context, db *pgxpool.Pool, batchID uuid.UUID) 
 	// Bring the parent's cached balance down by what the legs above actually
 	// debited from its merchant_payable account, same as PayoutBatch does
 	// for a non-split merchant.
-	// am: should pass netPayout here not totalAllocated, otherwise the cache drifts from the batch
-	if err := balances.ApplyPayout(ctx, tx, parentMerchantID, batchID, totalAllocated); err != nil {
+	// The legs above sum to netPayout exactly (a zero share posts nothing and
+	// adds nothing), so the cache comes down by the batch's net payout.
+	if totalAllocated != money.Fils(netPayout) {
+		return SplitPayoutResult{}, fmt.Errorf("splits: batch %s: allocated %d fils != net payout %d", batchID, totalAllocated, netPayout)
+	}
+	if err := balances.ApplyPayout(ctx, tx, parentMerchantID, batchID, money.Fils(netPayout)); err != nil {
 		return SplitPayoutResult{}, err
 	}
 
