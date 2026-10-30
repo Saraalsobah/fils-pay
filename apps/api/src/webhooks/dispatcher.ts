@@ -22,12 +22,12 @@ import type { WebhookTransport } from "./transport.js";
 
 const STEP_A_BATCH_LIMIT = 500;
 const STEP_B_BATCH_LIMIT = 100;
-// add refund.succeeded here when refunds ship, thats all it needs — am
 // YA: adding a type here without a buildEnvelope case throws in Step A and stalls the whole queue. envelope.ts first.
 // MK: settlement.batch_closed taken out of this list in Feb (too noisy). docs still mention it
 const WEBHOOK_ELIGIBLE_EVENT_TYPES: readonly string[] = [
   "transaction.captured",
   "transaction.voided",
+  "refund.succeeded",
   "settlement.paid",
 ];
 const NOTIFY_CHANNEL = "outbox_events_channel";

@@ -286,16 +286,134 @@ test("GET /v1/transactions/:id/events returns the timeline in chronological orde
   assert.equal(events[2]!.amountFils, 4_000);
 });
 
-// delete/replace this when FP-212 lands — am
-// MK: keep it until the route is behind the feature flag (REFUNDS_V2), then flip the assertion
-test("POST /v1/refunds returns 501 not_implemented", async () => {
-  const { rawKey } = await createApprovedMerchantWithApiKey("refund-stub");
-  const res = await app.inject({
+/** POST /v1/refunds (FP-300). */
+async function refund(
+  rawKey: string,
+  body: Record<string, unknown>,
+  idempotencyKey: string | null = randomUUID(),
+) {
+  return app.inject({
     method: "POST",
     url: "/v1/refunds",
-    headers: authHeader(rawKey),
-    payload: {},
+    headers: idempotencyKey === null ? authHeader(rawKey) : { ...authHeader(rawKey), "idempotency-key": idempotencyKey },
+    payload: body,
   });
-  assert.equal(res.statusCode, 501, res.body);
-  assert.equal(res.json().error, "not_implemented");
+}
+
+async function capturedTxn(rawKey: string, amountFils: number, captureFils?: number) {
+  const txn = await authorize(rawKey, amountFils);
+  const res = await capture(rawKey, txn.id, captureFils === undefined ? {} : { amountFils: captureFils });
+  assert.equal(res.statusCode, 200, res.body);
+  return txn;
+}
+
+test("POST /v1/refunds without credentials is 401", async () => {
+  const res = await app.inject({ method: "POST", url: "/v1/refunds", payload: {} });
+  assert.equal(res.statusCode, 401, res.body);
+});
+
+test("POST /v1/refunds refunds part of a captured transaction, reverses the fee and writes the timeline", async () => {
+  const { rawKey } = await createApprovedMerchantWithApiKey("refund-route", 250);
+  const txn = await capturedTxn(rawKey, 10_000);
+
+  const res = await refund(rawKey, { transactionId: txn.id, amountFils: 4_000, reason: "customer returned item" });
+  assert.equal(res.statusCode, 200, res.body);
+  const body = res.json();
+  assert.equal(body.amountFils, 4_000);
+  assert.equal(body.feeReversedFils, 100); // 2.50% of 4,000
+  assert.equal(body.transactionStatus, "partially_refunded");
+  assert.equal(body.refundedTotalFils, 4_000);
+
+  const detail = await app.inject({ method: "GET", url: `/v1/transactions/${txn.id}`, headers: authHeader(rawKey) });
+  assert.equal(detail.statusCode, 200, detail.body);
+  assert.equal(detail.json().status, "partially_refunded");
+
+  const events = await app.inject({
+    method: "GET",
+    url: `/v1/transactions/${txn.id}/events`,
+    headers: authHeader(rawKey),
+  });
+  const types = (events.json() as Array<{ eventType: string; amountFils: number }>).map((e) => e.eventType);
+  assert.deepEqual(types, ["authorized", "captured", "refund_partial"]);
+
+  // The refund queued exactly one webhook-able outbox event.
+  const outbox = await pool.query(`SELECT 1 FROM outbox_events WHERE event_type = 'refund.succeeded' AND aggregate_id = $1`, [
+    txn.id,
+  ]);
+  assert.equal(outbox.rows.length, 1);
+});
+
+test("POST /v1/refunds with no amount refunds everything still refundable", async () => {
+  const { rawKey } = await createApprovedMerchantWithApiKey("refund-all", 250);
+  const txn = await capturedTxn(rawKey, 10_000);
+  await refund(rawKey, { transactionId: txn.id, amountFils: 3_000 });
+
+  const res = await refund(rawKey, { transactionId: txn.id });
+  assert.equal(res.statusCode, 200, res.body);
+  assert.equal(res.json().amountFils, 7_000);
+  assert.equal(res.json().transactionStatus, "refunded");
+});
+
+test("POST /v1/refunds requires an Idempotency-Key header", async () => {
+  const { rawKey } = await createApprovedMerchantWithApiKey("refund-nokey");
+  const txn = await capturedTxn(rawKey, 10_000);
+  const res = await refund(rawKey, { transactionId: txn.id, amountFils: 1_000 }, null);
+  assert.equal(res.statusCode, 400, res.body);
+  assert.equal(res.json().error, "idempotency_key_required");
+});
+
+test("POST /v1/refunds replaying the same Idempotency-Key refunds once", async () => {
+  const { rawKey } = await createApprovedMerchantWithApiKey("refund-replay");
+  const txn = await capturedTxn(rawKey, 10_000);
+  const key = randomUUID();
+  const first = await refund(rawKey, { transactionId: txn.id, amountFils: 2_500 }, key);
+  const second = await refund(rawKey, { transactionId: txn.id, amountFils: 2_500 }, key);
+  assert.equal(first.statusCode, 200, first.body);
+  assert.equal(second.statusCode, 200, second.body);
+  assert.deepEqual(second.json(), first.json());
+  const rows = await pool.query(`SELECT 1 FROM refunds WHERE transaction_id = $1`, [txn.id]);
+  assert.equal(rows.rows.length, 1);
+});
+
+test("POST /v1/refunds rejects malformed input with 400", async () => {
+  const { rawKey } = await createApprovedMerchantWithApiKey("refund-badinput");
+  const txn = await capturedTxn(rawKey, 10_000);
+  for (const body of [
+    {},
+    { transactionId: "not-a-uuid" },
+    { transactionId: txn.id, amountFils: 10.5 },
+    { transactionId: txn.id, amountFils: "1000" },
+    { transactionId: txn.id, amountFils: 0 },
+    { transactionId: txn.id, amountFils: -5 },
+    { transactionId: txn.id, reason: 42 },
+  ]) {
+    const res = await refund(rawKey, body);
+    assert.equal(res.statusCode, 400, `${JSON.stringify(body)} -> ${res.statusCode} ${res.body}`);
+  }
+});
+
+test("POST /v1/refunds cannot exceed what was captured", async () => {
+  const { rawKey } = await createApprovedMerchantWithApiKey("refund-toomuch");
+  const txn = await capturedTxn(rawKey, 10_000, 4_000);
+  const res = await refund(rawKey, { transactionId: txn.id, amountFils: 4_001 });
+  assert.equal(res.statusCode, 422, res.body);
+  assert.equal(res.json().code, "refund_exceeds_refundable");
+  assert.equal(res.json().refundableFils, 4_000);
+});
+
+test("POST /v1/refunds on another merchant's transaction is 404 and refunds nothing", async () => {
+  const owner = await createApprovedMerchantWithApiKey("refund-owner");
+  const other = await createApprovedMerchantWithApiKey("refund-other");
+  const txn = await capturedTxn(owner.rawKey, 10_000);
+  const res = await refund(other.rawKey, { transactionId: txn.id, amountFils: 1_000 });
+  assert.equal(res.statusCode, 404, res.body);
+  const rows = await pool.query(`SELECT 1 FROM refunds WHERE transaction_id = $1`, [txn.id]);
+  assert.equal(rows.rows.length, 0);
+});
+
+test("POST /v1/refunds on an authorized (uncaptured) transaction is 409", async () => {
+  const { rawKey } = await createApprovedMerchantWithApiKey("refund-uncaptured");
+  const txn = await authorize(rawKey, 10_000);
+  const res = await refund(rawKey, { transactionId: txn.id, amountFils: 1_000 });
+  assert.equal(res.statusCode, 409, res.body);
 });
